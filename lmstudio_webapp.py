@@ -22,21 +22,24 @@ except ImportError:
 app = Flask(__name__)
 
 # ==========================================
-# ===== Ổ KHÓA BẢO MẬT (MỚI THÊM) ==========
+# ===== Ổ KHÓA BẢO MẬT (BẢN CẬP NHẬT) ======
 # ==========================================
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "") # Lấy pass từ Render
+# Lấy mật khẩu và xóa mọi khoảng trắng thừa nếu có
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 
 @app.before_request
 def check_login():
-    # Nếu có cài mật khẩu thì mới kiểm tra
-    if APP_PASSWORD: 
+    # Chỉ yêu cầu đăng nhập nếu biến APP_PASSWORD có giá trị (không rỗng)
+    if APP_PASSWORD:
         auth = request.authorization
-        # Yêu cầu nhập pass, username thì điền gì cũng được
+        
+        # Kiểm tra nếu chưa nhập hoặc nhập sai pass
+        # (Chấp nhận mọi username, chỉ check pass)
         if not auth or auth.password != APP_PASSWORD:
             return Response(
-                'Truy cập bị từ chối! Vui lòng tải lại trang và nhập đúng mật khẩu.', 
+                'Vui lòng nhập đúng mật khẩu để sử dụng App.', 
                 401, 
-                {'WWW-Authenticate': 'Basic realm="Vui long nhap mat khau"'}
+                {'WWW-Authenticate': 'Basic realm="Login Required"'}
             )
 # ==========================================
 
