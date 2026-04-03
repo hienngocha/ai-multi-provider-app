@@ -225,16 +225,32 @@ textarea:focus, input[type=text]:focus, select:focus { border-color: var(--accen
 
     <div class="panel" id="panel-translate">
       <h2>🌐 Dịch thuật</h2>
-      <p class="subtitle">Dịch văn bản chuyên sâu</p>
+      <p class="subtitle">Dịch văn bản chuyên sâu đa ngôn ngữ</p>
       <div class="card">
         <div style="display:flex;gap:10px;margin-bottom:1rem">
-          <select id="tr-src"><option value="English">English</option><option value="Vietnamese">Tiếng Việt</option></select>
+          <select id="tr-src">
+            <option value="English">English</option>
+            <option value="Vietnamese">Tiếng Việt</option>
+            <option value="Chinese">Tiếng Trung (Chinese)</option>
+            <option value="Japanese">Tiếng Nhật (Japanese)</option>
+            <option value="Korean">Tiếng Hàn (Korean)</option>
+            <option value="French">Tiếng Pháp (French)</option>
+            <option value="German">Tiếng Đức (German)</option>
+          </select>
           <button class="btn btn-ghost" onclick="let s=document.getElementById('tr-src'),d=document.getElementById('tr-dst');[s.value,d.value]=[d.value,s.value]">⇄</button>
-          <select id="tr-dst"><option value="Vietnamese">Tiếng Việt</option><option value="English">English</option></select>
+          <select id="tr-dst">
+            <option value="Vietnamese">Tiếng Việt</option>
+            <option value="English">English</option>
+            <option value="Chinese">Tiếng Trung (Chinese)</option>
+            <option value="Japanese">Tiếng Nhật (Japanese)</option>
+            <option value="Korean">Tiếng Hàn (Korean)</option>
+            <option value="French">Tiếng Pháp (French)</option>
+            <option value="German">Tiếng Đức (German)</option>
+          </select>
         </div>
         <textarea id="tr-input" rows="5" placeholder="Nhập văn bản cần dịch..."></textarea>
         <div class="btn-row">
-          <button class="btn btn-primary" onclick="callApi('translate', {text: val('tr-input'), src: val('tr-src'), dst: val('tr-dst')}, 'tr-btn', 'tr-output')">Dịch</button>
+          <button id="tr-btn" class="btn btn-primary" onclick="callApi('translate', {text: val('tr-input'), src: val('tr-src'), dst: val('tr-dst')}, 'tr-btn', 'tr-output')">Dịch</button>
         </div>
       </div>
       <div class="card"><div class="output empty" id="tr-output">Kết quả...</div></div>
