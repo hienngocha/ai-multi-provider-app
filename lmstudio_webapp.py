@@ -6,7 +6,7 @@ lmstudio_webapp.py
 Giao diện web cho LM Studio & Các API khác (Groq, OpenRouter).
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response # Thêm Response vào đây
 from openai import OpenAI
 import json, os, re, time
 
@@ -20,6 +20,25 @@ except ImportError:
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "YOUR_OPENROUTER_API_KEY")
 
 app = Flask(__name__)
+
+# ==========================================
+# ===== Ổ KHÓA BẢO MẬT (MỚI THÊM) ==========
+# ==========================================
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "") # Lấy pass từ Render
+
+@app.before_request
+def check_login():
+    # Nếu có cài mật khẩu thì mới kiểm tra
+    if APP_PASSWORD: 
+        auth = request.authorization
+        # Yêu cầu nhập pass, username thì điền gì cũng được
+        if not auth or auth.password != APP_PASSWORD:
+            return Response(
+                'Truy cập bị từ chối! Vui lòng tải lại trang và nhập đúng mật khẩu.', 
+                401, 
+                {'WWW-Authenticate': 'Basic realm="Vui long nhap mat khau"'}
+            )
+# ==========================================
 
 # Cấu hình đa nhà cung cấp (Multi-Provider)
 PROVIDERS = {
