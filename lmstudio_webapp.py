@@ -48,7 +48,6 @@ PROVIDERS = {
     "groq":       {"name": "Groq (Cloud - Fast)",      "base_url": "https://api.groq.com/openai/v1",  "api_key": GROQ_API_KEY,       "default_model": "llama3-70b-8192"},
     "openrouter": {"name": "OpenRouter (Multi-Model)", "base_url": "https://openrouter.ai/api/v1",    "api_key": OPENROUTER_API_KEY, "default_model": "google/gemini-pro-1.5"},
 }
-
 # ===== DATABASE - tu dong chon SQLite hoac Turso =====
 TURSO_URL   = os.environ.get("TURSO_URL", "").strip()
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "").strip()
@@ -163,15 +162,93 @@ def parse_reply(content):
         text = text.replace(tok, "")
     return text.strip()
 
+# ===== GROQ RATE LIMITER =====
+# Groq free: 8000 tokens/phut, 30 req/phut
+import threading, time as _time
+_groq_lock     = threading.Lock()
+_groq_tokens   = 0
+_groq_reqs     = 0
+_groq_reset_at = 0.0
+GROQ_MAX_TPM   = 7500   # gia tri an toan duoi gioi han 8000
+GROQ_MAX_RPM   = 28
+
+def _groq_wait(estimated_tokens=500):
+    global _groq_tokens, _groq_reqs, _groq_reset_at
+    with _groq_lock:
+        now = _time.time()
+        if now >= _groq_reset_at:           # Reset moi phut
+            _groq_tokens   = 0
+            _groq_reqs     = 0
+            _groq_reset_at = now + 60.0
+        wait = 0.0
+        if _groq_tokens + estimated_tokens > GROQ_MAX_TPM:
+            wait = max(wait, _groq_reset_at - now)
+        if _groq_reqs >= GROQ_MAX_RPM:
+            wait = max(wait, _groq_reset_at - now)
+        if wait > 0:
+            print(f"  [Groq RL] cho {wait:.1f}s (tokens={_groq_tokens}, reqs={_groq_reqs})")
+        _groq_tokens += estimated_tokens
+        _groq_reqs   += 1
+    if wait > 0:
+        _time.sleep(wait)
+
+def _estimate_tokens(messages):
+    return sum(len(m.get("content","")) // 3 for m in messages) + 200
+
 def llm_call(messages, d, max_tokens=1024, temperature=0.7):
     try:
         provider = d.get('provider', 'lmstudio')
         model    = d.get('model') or PROVIDERS[provider]["default_model"]
-        resp     = get_client(provider).chat.completions.create(
+        if provider == 'groq':
+            _groq_wait(_estimate_tokens(messages) + max_tokens)
+        resp = get_client(provider).chat.completions.create(
             model=model, messages=messages, max_tokens=max_tokens, temperature=temperature)
         return parse_reply(resp.choices[0].message.content or "")
     except Exception as e:
-        return f"Lỗi API: {str(e)}"
+        err = str(e)
+        if '429' in err and 'groq' in d.get('provider',''):
+            _time.sleep(15)
+            try:
+                resp = get_client(d.get('provider')).chat.completions.create(
+                    model=d.get('model') or PROVIDERS[d.get('provider')]["default_model"],
+                    messages=messages, max_tokens=max_tokens, temperature=temperature)
+                return parse_reply(resp.choices[0].message.content or "")
+            except Exception as e2:
+                return f"Lỗi sau retry: {str(e2)}"
+        return f"Lỗi API: {err}"
+
+# ===== FILE PROCESSING =====
+import base64, mimetypes
+
+ALLOWED_EXT = {'.txt','.md','.py','.js','.ts','.json','.csv','.html','.css',
+               '.xml','.yaml','.yml','.ini','.sh','.bat','.sql','.log',
+               '.pdf','.png','.jpg','.jpeg','.gif','.webp'}
+MAX_FILE_MB  = 5
+MAX_TEXT_CHARS = 12000   # cat ngan neu qua dai
+
+def _read_file_content(file_storage):
+    """Doc noi dung file, tra ve (text|None, mime_type, ten_file)."""
+    fname = file_storage.filename or "file"
+    ext   = os.path.splitext(fname)[1].lower()
+    if ext not in ALLOWED_EXT:
+        return None, None, fname
+    data  = file_storage.read()
+    if len(data) > MAX_FILE_MB * 1024 * 1024:
+        return None, "too_large", fname
+    mime  = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+    # File van ban
+    if mime.startswith("text/") or ext in {'.py','.js','.ts','.json','.csv',
+            '.xml','.yaml','.yml','.ini','.sh','.bat','.sql','.log','.md'}:
+        try:
+            text = data.decode("utf-8", errors="replace")
+            return text[:MAX_TEXT_CHARS], "text", fname
+        except:
+            return None, None, fname
+    # File anh
+    if mime.startswith("image/"):
+        b64 = base64.b64encode(data).decode()
+        return b64, mime, fname
+    return None, None, fname
 
 def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -357,13 +434,17 @@ textarea.inp:focus,input.inp:focus,select.inp:focus{border-color:var(--ac)}
           <div class="mrow sys"><div class="bbl">Chọn cuộc trò chuyện bên trái hoặc nhấn ✏️ để bắt đầu mới</div></div>
         </div>
         <div class="chat-footer">
+          <div id="file-preview" style="display:none;padding:6px 0 4px;display:flex;align-items:center;gap:8px"></div>
           <div class="cin-wrap">
+            <label class="fbtn" title="Đính kèm file" style="width:36px;height:36px;background:var(--bg2);border:1px solid var(--bd);border-radius:9px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--tx2);font-size:.95rem;flex-shrink:0;transition:all .15s" onmouseover="this.style.borderColor='var(--ac)'" onmouseout="this.style.borderColor='var(--bd)'">
+              📎<input type="file" id="file-input" style="display:none" onchange="onFileSelect(this)" accept=".txt,.md,.py,.js,.ts,.json,.csv,.html,.css,.xml,.yaml,.yml,.sh,.sql,.log,.pdf,.png,.jpg,.jpeg,.gif,.webp">
+            </label>
             <textarea id="chat-input" rows="1" placeholder="Nhập tin nhắn... (Enter gửi, Shift+Enter xuống dòng)"
               oninput="arz(this)"
               onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}"></textarea>
             <button class="sbtn" id="sbtn" onclick="sendChat()">➤</button>
           </div>
-          <div class="chint">Enter gửi · Shift+Enter xuống dòng</div>
+          <div class="chint">Enter gửi · Shift+Enter xuống dòng · 📎 Đính kèm file</div>
         </div>
       </div>
     </div>
@@ -622,37 +703,89 @@ function addBbl(role,content,time=''){
   m.scrollTop=m.scrollHeight;
 }
 
+let _fileInfo = null;   // File dang duoc dinh kem
+
+function onFileSelect(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const prev = $('file-preview');
+
+  // Hien thi preview
+  prev.style.display = 'flex';
+  prev.innerHTML = `
+    <span style="font-size:.8rem;background:var(--bg3);border:1px solid var(--bd);border-radius:6px;
+      padding:3px 8px;color:var(--tx2);display:flex;align-items:center;gap:6px">
+      📄 ${file.name} (${(file.size/1024).toFixed(1)}KB)
+      <span onclick="clearFile()" style="cursor:pointer;color:var(--rd);font-weight:600" title="Xoa file">✕</span>
+    </span>
+    <span id="upload-status" style="font-size:.75rem;color:var(--tx3)">Dang tai...</span>`;
+
+  // Upload len server
+  const fd = new FormData();
+  fd.append('file', file);
+  fetch('/api/upload', {method:'POST', body:fd})
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) {
+        $('upload-status').textContent = '❌ ' + d.error;
+        $('upload-status').style.color = 'var(--rd)';
+        _fileInfo = null;
+      } else {
+        $('upload-status').textContent = '✅ San sang';
+        $('upload-status').style.color = 'var(--gr)';
+        _fileInfo = d;
+      }
+    })
+    .catch(e => {
+      $('upload-status').textContent = '❌ Loi upload';
+      _fileInfo = null;
+    });
+  input.value = '';
+}
+
+function clearFile() {
+  _fileInfo = null;
+  const prev = $('file-preview');
+  prev.style.display = 'none';
+  prev.innerHTML = '';
+}
+
 async function sendChat(){
   const inp=$('chat-input'), msg=inp.value.trim();
-  if(!msg) return;
+  if(!msg && !_fileInfo) return;
   if(!curSid){
+    const title = msg || (_fileInfo ? 'File: ' + _fileInfo.name : 'Cuoc tro chuyen moi');
     const r=await fetch('/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({title:msg.length>40?msg.slice(0,40)+'...':msg,
+      body:JSON.stringify({title:title.length>40?title.slice(0,40)+'...':title,
         system_prompt:$('chat-system').value.trim(),provider:$('gp').value,model:$('gm').value})});
     curSid=(await r.json()).id;
   }
   const now=new Date().toLocaleTimeString('vi',{hour:'2-digit',minute:'2-digit'});
-  addBbl('user',msg,now);
-  chatMsgs.push({role:'user',content:msg});
+  // Hien thi tin nhan user (co the co label file)
+  const userLabel = msg + (_fileInfo ? `
+📎 ${_fileInfo.name}` : '');
+  addBbl('user', userLabel, now);
+  chatMsgs.push({role:'user', content: msg || `[File: ${_fileInfo?.name}]`});
   inp.value=''; inp.style.height='auto';
+  const fileToSend = _fileInfo;
+  clearFile();
   $('sbtn').disabled=true;
-  // Typing indicator
   const m=$('chat-msgs');
   m.innerHTML+=`<div class="mrow ai" id="trow"><div class="av ai">🤖</div><div class="bbl"><div class="tyd"><span></span><span></span><span></span></div></div></div>`;
   m.scrollTop=m.scrollHeight;
   try{
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:msg,history:chatMsgs,
-        system:$('chat-system').value.trim()||'Bạn là trợ lý AI hữu ích.',
-        provider:$('gp').value,model:$('gm').value,session_id:curSid})});
+      body:JSON.stringify({message:msg, history:chatMsgs, file:fileToSend,
+        system:$('chat-system').value.trim()||'Ban la tro ly AI huu ich.',
+        provider:$('gp').value, model:$('gm').value, session_id:curSid})});
     const d=await r.json();
     $('trow')?.remove();
-    const reply=d.reply||'(Không có phản hồi)';
+    const reply=d.reply||'(Khong co phan hoi)';
     const t2=new Date().toLocaleTimeString('vi',{hour:'2-digit',minute:'2-digit'});
     addBbl('ai',reply,t2);
     chatMsgs.push({role:'assistant',content:reply});
     await loadHistory();
-  }catch(e){ $('trow')?.remove(); addBbl('sys','❌ Lỗi: '+e.message); }
+  }catch(e){ $('trow')?.remove(); addBbl('sys','❌ Loi: '+e.message); }
   $('sbtn').disabled=false;
 }
 
@@ -728,16 +861,60 @@ def delete_session(sid):
     db_execute("DELETE FROM sessions WHERE id=?", (sid,))
     return jsonify({"ok": True})
 
+@app.route('/api/upload', methods=['POST'])
+def api_upload():
+    """Nhan file, tra ve noi dung da xu ly de chat."""
+    if 'file' not in request.files:
+        return jsonify({"error": "Khong co file"}), 400
+    f = request.files['file']
+    content_data, ctype, fname = _read_file_content(f)
+    if ctype == "too_large":
+        return jsonify({"error": f"File qua lon (toi da {MAX_FILE_MB}MB)"}), 400
+    if content_data is None:
+        return jsonify({"error": f"Dinh dang khong ho tro: {fname}"}), 400
+    return jsonify({"content": content_data, "type": ctype,
+                    "name": fname, "is_image": ctype not in ("text","too_large")})
+
 @app.route('/api/chat', methods=['POST'])
 def api_chat():
-    d=request.json; sid=d.get('session_id'); user_msg=d.get('message','')
-    msgs=[{"role":"system","content":d.get("system","Bạn là trợ lý AI hữu ích.")}]
-    msgs.extend(d.get("history",[]))
-    reply=llm_call(msgs,d,max_tokens=1024,temperature=0.7)
+    d         = request.json
+    sid       = d.get('session_id')
+    user_msg  = d.get('message', '')
+    file_info = d.get('file')         # {"content":..., "type":..., "name":..., "is_image":...}
+    provider  = d.get('provider', 'lmstudio')
+    system    = d.get("system", "Ban la tro ly AI huu ich.")
+
+    msgs = [{"role": "system", "content": system}]
+    msgs.extend(d.get("history", []))
+
+    # Xu ly file dinh kem
+    if file_info:
+        fname = file_info.get("name", "file")
+        if file_info.get("is_image"):
+            # Anh: dung vision API (ho tro LM Studio vision model, OpenRouter)
+            mime = file_info["type"]
+            b64  = file_info["content"]
+            user_content = [
+                {"type": "text",      "text": user_msg or f"Phan tich anh: {fname}"},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+            ]
+            msgs.append({"role": "user", "content": user_content})
+        else:
+            # Van ban/code: nhung noi dung vao message
+            ftext  = file_info["content"]
+            block  = f"[File: {fname}]\n```\n{ftext}\n```"
+            prompt = block + "\n\n" + user_msg if user_msg else block + "\n\nHay phan tich noi dung file nay."
+            msgs.append({"role": "user", "content": prompt})
+    else:
+        msgs.append({"role": "user", "content": user_msg})
+
+    reply = llm_call(msgs, d, max_tokens=1024, temperature=0.7)
+
     if sid:
         ts = now_str()
+        label = user_msg + (f" [+{file_info['name']}]" if file_info else "")
         db_execute("INSERT INTO messages (session_id,role,content,created_at) VALUES (?,?,?,?)",
-                   (sid, 'user', user_msg, ts))
+                   (sid, 'user', label, ts))
         db_execute("INSERT INTO messages (session_id,role,content,created_at) VALUES (?,?,?,?)",
                    (sid, 'assistant', reply, ts))
         db_execute("UPDATE sessions SET updated_at=? WHERE id=?", (ts, sid))
@@ -792,7 +969,7 @@ if __name__=='__main__':
     print(f"\n{'='*46}\n  AI Apps v2.0 — SQLite Chat History\n{'='*46}")
     print(f"  Local : http://localhost:5000")
     print(f"  LAN   : http://{ip}:5000")
-#    print(f"  DB    : {DB_PATH}")
+    print(f"  DB    : {_db_path if not USE_TURSO else TURSO_URL}")
     print(f"\n  Deploy Render: Thêm biến môi trường:")
     print(f"    GROQ_API_KEY, OPENROUTER_API_KEY, APP_PASSWORD")
     print(f"    DB_PATH=/var/data/chat.db  (nếu dùng Render Disk)")
