@@ -1,17 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-lmstudio_webapp.py — v2.0
+lmstudio_webapp.py - v2.1
 ==========================
-Web app AI với giao diện mới + SQLite lưu lịch sử chat.
+Web app AI voi giao dien moi + luu lich su chat.
 
-Cài đặt: pip install flask openai
-Chạy   : python lmstudio_webapp.py
+Database:
+  - Local / LAN : SQLite (mac dinh, khong can cai them)
+  - Render cloud: Turso (libSQL cloud, mien phi 5GB)
+
+Cai dat:
+  pip install flask openai
+  pip install libsql-client   # Chi can khi dung Turso
+
+Chay local:
+  python lmstudio_webapp.py
+
+Deploy Render (dung Turso):
+  Bien moi truong can set:
+    TURSO_URL      = libsql://ten-db.turso.io
+    TURSO_TOKEN    = eyJhbGci...
+    GROQ_API_KEY   = gsk_...
+    OPENROUTER_API_KEY = sk-or-...
+    APP_PASSWORD   = matkhau  (tuy chon)
 """
 
 from flask import Flask, request, jsonify, Response
 from openai import OpenAI
-import json, os, re, time, sqlite3, uuid
+import json, os, re, sqlite3, uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -24,9 +40,7 @@ except ImportError:
     GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
-DB_PATH      = Path(__file__).parent / "chat_history.db"
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
-
 app = Flask(__name__)
 
 PROVIDERS = {
@@ -35,23 +49,99 @@ PROVIDERS = {
     "openrouter": {"name": "OpenRouter (Multi-Model)", "base_url": "https://openrouter.ai/api/v1",    "api_key": OPENROUTER_API_KEY, "default_model": "google/gemini-pro-1.5"},
 }
 
-# ===== DATABASE =====
-def init_db():
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY, title TEXT NOT NULL,
-            system_prompt TEXT DEFAULT '', provider TEXT DEFAULT 'lmstudio',
-            model TEXT DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
-            role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL,
-            FOREIGN KEY (session_id) REFERENCES sessions(id))""")
-        c.commit()
+# ===== DATABASE - tu dong chon SQLite hoac Turso =====
+TURSO_URL   = os.environ.get("TURSO_URL", "").strip()
+TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "").strip()
+USE_TURSO   = bool(TURSO_URL and TURSO_TOKEN)
 
-def db():
-    c = sqlite3.connect(DB_PATH)
+_CREATE_SESSIONS = """CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY, title TEXT NOT NULL,
+    system_prompt TEXT DEFAULT '', provider TEXT DEFAULT 'lmstudio',
+    model TEXT DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"""
+
+_CREATE_MESSAGES_SQLITE = """CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+    role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL)"""
+
+_CREATE_MESSAGES_TURSO = """CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+    role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL)"""
+
+
+# --- SQLite (local) ---
+_db_path = Path(os.environ.get("DB_PATH", "") or (Path(__file__).parent / "chat_history.db"))
+
+def _sqlite_conn():
+    c = sqlite3.connect(str(_db_path))
     c.row_factory = sqlite3.Row
     return c
+
+def _sqlite_init():
+    _db_path.parent.mkdir(parents=True, exist_ok=True)
+    with _sqlite_conn() as c:
+        c.execute(_CREATE_SESSIONS)
+        c.execute(_CREATE_MESSAGES_SQLITE)
+        c.commit()
+
+
+# --- Turso (cloud) ---
+_turso_client = None
+
+def _get_turso():
+    global _turso_client
+    if _turso_client is None:
+        try:
+            import libsql_client
+            _turso_client = libsql_client.create_client_sync(
+                url=TURSO_URL, auth_token=TURSO_TOKEN)
+        except ImportError:
+            raise RuntimeError(
+                "Thu vien libsql-client chua duoc cai.\n"
+                "Chay: pip install libsql-client")
+    return _turso_client
+
+def _turso_init():
+    c = _get_turso()
+    c.execute(_CREATE_SESSIONS)
+    c.execute(_CREATE_MESSAGES_TURSO)
+
+def _turso_rows(result):
+    cols = [col.name for col in result.columns] if result.columns else []
+    return [dict(zip(cols, row)) for row in (result.rows or [])]
+
+
+# --- Interface thong nhat (dung cho ca SQLite va Turso) ---
+def init_db():
+    if USE_TURSO:
+        _turso_init()
+        print(f"  DB : Turso cloud ({TURSO_URL})")
+    else:
+        _sqlite_init()
+        print(f"  DB : SQLite ({_db_path})")
+
+def db_execute(sql, params=()):
+    if USE_TURSO:
+        _get_turso().execute(sql, list(params))
+    else:
+        with _sqlite_conn() as c:
+            c.execute(sql, params)
+            c.commit()
+
+def db_fetchall(sql, params=()):
+    if USE_TURSO:
+        result = _get_turso().execute(sql, list(params))
+        return _turso_rows(result)
+    else:
+        with _sqlite_conn() as c:
+            rows = c.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+
+def db_fetchone(sql, params=()):
+    rows = db_fetchall(sql, params)
+    return rows[0] if rows else None
+
+# Chay ngay khi module load (can cho gunicorn/Render)
+init_db()
 
 # ===== AUTH =====
 @app.before_request
@@ -92,7 +182,27 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Apps</title>
 <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500&family=Geist:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
 <style>
+/* Markdown rendering trong bubble chat */
+.bbl.md-content h1,.bbl.md-content h2,.bbl.md-content h3{font-weight:600;margin:.6em 0 .3em;line-height:1.3}
+.bbl.md-content h1{font-size:1.1em}.bbl.md-content h2{font-size:1em}.bbl.md-content h3{font-size:.95em}
+.bbl.md-content p{margin:.4em 0;line-height:1.65}
+.bbl.md-content ul,.bbl.md-content ol{padding-left:1.4em;margin:.4em 0}
+.bbl.md-content li{margin:.2em 0;line-height:1.6}
+.bbl.md-content table{border-collapse:collapse;width:100%;margin:.6em 0;font-size:.85em}
+.bbl.md-content th,.bbl.md-content td{border:1px solid var(--bd2);padding:6px 10px;text-align:left}
+.bbl.md-content th{background:var(--bg3);font-weight:600;color:var(--tx)}
+.bbl.md-content td{background:var(--bg2);color:var(--tx2)}
+.bbl.md-content tr:hover td{background:var(--bg3)}
+.bbl.md-content code{background:var(--bg3);border:1px solid var(--bd);border-radius:4px;padding:1px 5px;font-family:var(--f1);font-size:.85em;color:var(--ac2)}
+.bbl.md-content pre{background:var(--bg0);border:1px solid var(--bd);border-radius:8px;padding:10px 12px;overflow-x:auto;margin:.5em 0}
+.bbl.md-content pre code{background:none;border:none;padding:0;font-size:.82em;color:var(--tx)}
+.bbl.md-content blockquote{border-left:3px solid var(--ac);padding:.3em .8em;margin:.4em 0;color:var(--tx2);background:var(--bg2);border-radius:0 6px 6px 0}
+.bbl.md-content strong{font-weight:600;color:var(--tx)}
+.bbl.md-content em{font-style:italic;color:var(--tx2)}
+.bbl.md-content hr{border:none;border-top:1px solid var(--bd);margin:.6em 0}
+.bbl.md-content a{color:var(--ac2);text-decoration:underline}
 :root{
   --bg0:#09090b;--bg1:#111115;--bg2:#18181c;--bg3:#222228;
   --bd:#2e2e36;--bd2:#3a3a44;
@@ -499,8 +609,15 @@ function addBbl(role,content,time=''){
   }
   const u=role==='user';
   const av=u?`<div class="av user">👤</div>`:`<div class="av ai">🤖</div>`;
+  // User: escape HTML thuần | AI: render markdown
+  const rendered = u
+    ? esc(content)
+    : (typeof marked !== 'undefined'
+        ? marked.parse(content, {breaks:true, gfm:true})
+        : esc(content));
+  const mdClass = u ? '' : ' md-content';
   m.innerHTML+=`<div class="mrow ${u?'user':'ai'}">${u?'':av}
-    <div><div class="bbl">${esc(content)}</div>${time?`<div class="msg-t">${time}</div>`:''}</div>
+    <div><div class="bbl${mdClass}">${rendered}</div>${time?`<div class="msg-t">${time}</div>`:''}</div>
     ${u?av:''}</div>`;
   m.scrollTop=m.scrollHeight;
 }
@@ -587,33 +704,29 @@ def api_models():
 
 @app.route('/api/sessions', methods=['GET'])
 def get_sessions():
-    with db() as c:
-        rows = c.execute("SELECT * FROM sessions ORDER BY updated_at DESC LIMIT 100").fetchall()
-    return jsonify([dict(r) for r in rows])
+    rows = db_fetchall("SELECT * FROM sessions ORDER BY updated_at DESC LIMIT 100")
+    return jsonify(rows)
 
 @app.route('/api/sessions', methods=['POST'])
 def create_session():
     d=request.json; sid=str(uuid.uuid4()); ts=now_str()
-    with db() as c:
-        c.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?)",
-            (sid,d.get('title','Cuộc trò chuyện mới'),d.get('system_prompt',''),
-             d.get('provider','lmstudio'),d.get('model',''),ts,ts))
+    db_execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?)",
+        (sid, d.get('title','Cuoc tro chuyen moi'), d.get('system_prompt',''),
+         d.get('provider','lmstudio'), d.get('model',''), ts, ts))
     return jsonify({"id":sid,"title":d.get('title'),"created_at":ts,"updated_at":ts})
 
 @app.route('/api/sessions/<sid>', methods=['GET'])
 def get_session(sid):
-    with db() as c:
-        s = c.execute("SELECT * FROM sessions WHERE id=?",(sid,)).fetchone()
-        ms = c.execute("SELECT * FROM messages WHERE session_id=? ORDER BY id",(sid,)).fetchall()
-    if not s: return jsonify({"error":"Not found"}),404
-    return jsonify({"session":dict(s),"messages":[dict(m) for m in ms]})
+    s  = db_fetchone("SELECT * FROM sessions WHERE id=?", (sid,))
+    ms = db_fetchall("SELECT * FROM messages WHERE session_id=? ORDER BY id", (sid,))
+    if not s: return jsonify({"error":"Not found"}), 404
+    return jsonify({"session": s, "messages": ms})
 
 @app.route('/api/sessions/<sid>', methods=['DELETE'])
 def delete_session(sid):
-    with db() as c:
-        c.execute("DELETE FROM messages WHERE session_id=?",(sid,))
-        c.execute("DELETE FROM sessions WHERE id=?",(sid,))
-    return jsonify({"ok":True})
+    db_execute("DELETE FROM messages WHERE session_id=?", (sid,))
+    db_execute("DELETE FROM sessions WHERE id=?", (sid,))
+    return jsonify({"ok": True})
 
 @app.route('/api/chat', methods=['POST'])
 def api_chat():
@@ -622,12 +735,13 @@ def api_chat():
     msgs.extend(d.get("history",[]))
     reply=llm_call(msgs,d,max_tokens=1024,temperature=0.7)
     if sid:
-        ts=now_str()
-        with db() as c:
-            c.execute("INSERT INTO messages (session_id,role,content,created_at) VALUES (?,?,?,?)",(sid,'user',user_msg,ts))
-            c.execute("INSERT INTO messages (session_id,role,content,created_at) VALUES (?,?,?,?)",(sid,'assistant',reply,ts))
-            c.execute("UPDATE sessions SET updated_at=? WHERE id=?",(ts,sid))
-    return jsonify({"reply":reply})
+        ts = now_str()
+        db_execute("INSERT INTO messages (session_id,role,content,created_at) VALUES (?,?,?,?)",
+                   (sid, 'user', user_msg, ts))
+        db_execute("INSERT INTO messages (session_id,role,content,created_at) VALUES (?,?,?,?)",
+                   (sid, 'assistant', reply, ts))
+        db_execute("UPDATE sessions SET updated_at=? WHERE id=?", (ts, sid))
+    return jsonify({"reply": reply})
 
 @app.route('/api/optimize_prompt', methods=['POST'])
 def api_optimize():
@@ -672,12 +786,15 @@ def api_terminal():
     return jsonify({"result":r})
 
 if __name__=='__main__':
-    init_db()
+    # init_db() đã chạy ở module level — không cần gọi lại
     import socket
     ip=socket.gethostbyname(socket.gethostname())
     print(f"\n{'='*46}\n  AI Apps v2.0 — SQLite Chat History\n{'='*46}")
     print(f"  Local : http://localhost:5000")
     print(f"  LAN   : http://{ip}:5000")
-    print(f"  DB    : {DB_PATH}")
+#    print(f"  DB    : {DB_PATH}")
+    print(f"\n  Deploy Render: Thêm biến môi trường:")
+    print(f"    GROQ_API_KEY, OPENROUTER_API_KEY, APP_PASSWORD")
+    print(f"    DB_PATH=/var/data/chat.db  (nếu dùng Render Disk)")
     print(f"{'='*46}\n")
     app.run(host='0.0.0.0',port=5000,debug=False)
