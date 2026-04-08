@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-lmstudio_webapp.py - v2.1
+lmstudio_webapp.py - v2.2
 ==========================
 Web app AI voi giao dien moi + luu lich su chat.
 
@@ -11,7 +11,7 @@ Database:
 
 Cai dat:
   pip install flask openai
-  pip install libsql-client   # Chi can khi dung Turso
+  pip install requests         # Da co san trong flask, khong can cai them
 
 Chay local:
   python lmstudio_webapp.py
@@ -42,13 +42,15 @@ except ImportError:
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 app = Flask(__name__)
-
 PROVIDERS = {
     "lmstudio":   {"name": "LM Studio (Local)",       "base_url": f"{LM_STUDIO_URL}/v1",             "api_key": "lm-studio",        "default_model": "local-model"},
     "groq":       {"name": "Groq (Cloud - Fast)",      "base_url": "https://api.groq.com/openai/v1",  "api_key": GROQ_API_KEY,       "default_model": "llama3-70b-8192"},
     "openrouter": {"name": "OpenRouter (Multi-Model)", "base_url": "https://openrouter.ai/api/v1",    "api_key": OPENROUTER_API_KEY, "default_model": "google/gemini-pro-1.5"},
 }
-# ===== DATABASE - tu dong chon SQLite hoac Turso =====
+
+# ===== DATABASE =====
+# Tu dong chon: Turso HTTP API (cloud) hoac SQLite (local)
+# Turso HTTP API: khong dung asyncio, tuong thich gunicorn sync worker
 TURSO_URL   = os.environ.get("TURSO_URL", "").strip()
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "").strip()
 USE_TURSO   = bool(TURSO_URL and TURSO_TOKEN)
@@ -58,16 +60,77 @@ _CREATE_SESSIONS = """CREATE TABLE IF NOT EXISTS sessions (
     system_prompt TEXT DEFAULT '', provider TEXT DEFAULT 'lmstudio',
     model TEXT DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"""
 
-_CREATE_MESSAGES_SQLITE = """CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
-    role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL)"""
-
-_CREATE_MESSAGES_TURSO = """CREATE TABLE IF NOT EXISTS messages (
+_CREATE_MESSAGES = """CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
     role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL)"""
 
 
-# --- SQLite (local) ---
+# ── Turso HTTP API (dung requests, khong asyncio) ──
+import requests as _req
+
+def _turso_http(sql, params=()):
+    """
+    Goi Turso qua HTTP API.
+    Tra ve list of dict, hoac [] neu khong co ket qua.
+    Turso HTTP endpoint: POST /v2/pipeline
+    """
+    # Chuyen params thanh dung dinh dang Turso mong doi
+    args = []
+    for p in params:
+        if p is None:
+            args.append({"type": "null"})
+        elif isinstance(p, int):
+            args.append({"type": "integer", "value": str(p)})
+        elif isinstance(p, float):
+            args.append({"type": "float", "value": str(p)})
+        else:
+            args.append({"type": "text", "value": str(p)})
+
+    # Turso URL co the dang https:// hoac libsql://
+    # HTTP API can dung https://
+    base_url = TURSO_URL.replace("libsql://", "https://")
+    endpoint = f"{base_url}/v2/pipeline"
+    headers  = {
+        "Authorization": f"Bearer {TURSO_TOKEN}",
+        "Content-Type":  "application/json",
+    }
+    payload = {
+        "requests": [
+            {"type": "execute", "stmt": {"sql": sql, "args": args}},
+            {"type": "close"}
+        ]
+    }
+    resp = _req.post(endpoint, json=payload, headers=headers, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Parse ket qua
+    result = data.get("results", [{}])[0]
+    if result.get("type") == "error":
+        raise Exception(f"Turso error: {result.get('error', {}).get('message', 'unknown')}")
+
+    rows_data = result.get("response", {}).get("result", {})
+    cols  = [c.get("name") for c in rows_data.get("cols", [])]
+    rows  = rows_data.get("rows", [])
+    out   = []
+    for row in rows:
+        vals = []
+        for cell in row:
+            t = cell.get("type", "null")
+            v = cell.get("value")
+            if t == "null" or v is None:
+                vals.append(None)
+            elif t == "integer":
+                vals.append(int(v))
+            elif t == "float":
+                vals.append(float(v))
+            else:
+                vals.append(v)
+        out.append(dict(zip(cols, vals)))
+    return out
+
+
+# ── SQLite local ──
 _db_path = Path(os.environ.get("DB_PATH", "") or (Path(__file__).parent / "chat_history.db"))
 
 def _sqlite_conn():
@@ -75,52 +138,26 @@ def _sqlite_conn():
     c.row_factory = sqlite3.Row
     return c
 
-def _sqlite_init():
-    _db_path.parent.mkdir(parents=True, exist_ok=True)
-    with _sqlite_conn() as c:
-        c.execute(_CREATE_SESSIONS)
-        c.execute(_CREATE_MESSAGES_SQLITE)
-        c.commit()
 
-
-# --- Turso (cloud) ---
-_turso_client = None
-
-def _get_turso():
-    global _turso_client
-    if _turso_client is None:
-        try:
-            import libsql_client
-            _turso_client = libsql_client.create_client_sync(
-                url=TURSO_URL, auth_token=TURSO_TOKEN)
-        except ImportError:
-            raise RuntimeError(
-                "Thu vien libsql-client chua duoc cai.\n"
-                "Chay: pip install libsql-client")
-    return _turso_client
-
-def _turso_init():
-    c = _get_turso()
-    c.execute(_CREATE_SESSIONS)
-    c.execute(_CREATE_MESSAGES_TURSO)
-
-def _turso_rows(result):
-    cols = [col.name for col in result.columns] if result.columns else []
-    return [dict(zip(cols, row)) for row in (result.rows or [])]
-
-
-# --- Interface thong nhat (dung cho ca SQLite va Turso) ---
+# ── Interface thong nhat ──
 def init_db():
     if USE_TURSO:
-        _turso_init()
-        print(f"  DB : Turso cloud ({TURSO_URL})")
+        _turso_http(_CREATE_SESSIONS)
+        _turso_http(_CREATE_MESSAGES)
+        print(f"  DB : Turso HTTP API ({TURSO_URL})")
     else:
-        _sqlite_init()
+        _db_path.parent.mkdir(parents=True, exist_ok=True)
+        with _sqlite_conn() as c:
+            c.execute(_CREATE_SESSIONS)
+            c.execute(_CREATE_MESSAGES.replace(
+                "INTEGER PRIMARY KEY",
+                "INTEGER PRIMARY KEY AUTOINCREMENT"))
+            c.commit()
         print(f"  DB : SQLite ({_db_path})")
 
 def db_execute(sql, params=()):
     if USE_TURSO:
-        _get_turso().execute(sql, list(params))
+        _turso_http(sql, params)
     else:
         with _sqlite_conn() as c:
             c.execute(sql, params)
@@ -128,8 +165,7 @@ def db_execute(sql, params=()):
 
 def db_fetchall(sql, params=()):
     if USE_TURSO:
-        result = _get_turso().execute(sql, list(params))
-        return _turso_rows(result)
+        return _turso_http(sql, params)
     else:
         with _sqlite_conn() as c:
             rows = c.execute(sql, params).fetchall()
@@ -908,7 +944,7 @@ def api_chat():
     else:
         msgs.append({"role": "user", "content": user_msg})
 
-    reply = llm_call(msgs, d, max_tokens=2048, temperature=0.7)
+    reply = llm_call(msgs, d, max_tokens=1024, temperature=0.7)
 
     if sid:
         ts = now_str()
@@ -924,7 +960,7 @@ def api_chat():
 def api_optimize():
     d=request.json
     r=llm_call([{"role":"system","content":"Bạn là chuyên gia Prompt Engineering. Viết lại thành prompt chuyên nghiệp, chi tiết. Chỉ trả về prompt, không giải thích."},
-                {"role":"user","content":f"Yêu cầu: {d['text']}"}],d,max_tokens=2048,temperature=0.5)
+                {"role":"user","content":f"Yêu cầu: {d['text']}"}],d,max_tokens=1024,temperature=0.5)
     return jsonify({"result":r})
 
 @app.route('/api/translate', methods=['POST'])
