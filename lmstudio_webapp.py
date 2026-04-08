@@ -944,7 +944,7 @@ def api_chat():
     else:
         msgs.append({"role": "user", "content": user_msg})
 
-    reply = llm_call(msgs, d, max_tokens=1024, temperature=0.7)
+    reply = llm_call(msgs, d, max_tokens=8192, temperature=0.7)
 
     if sid:
         ts = now_str()
