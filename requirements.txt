@@ -3,3 +3,4 @@ openai
 gunicorn
 libsql-client
 pypdf
+requests
