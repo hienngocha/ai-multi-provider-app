@@ -298,24 +298,25 @@ HTML = r"""<!DOCTYPE html>
 <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
 <style>
 /* Markdown rendering trong bubble chat */
-.bbl.md-content h1,.bbl.md-content h2,.bbl.md-content h3{font-weight:600;margin:.6em 0 .3em;line-height:1.3}
-.bbl.md-content h1{font-size:1.1em}.bbl.md-content h2{font-size:1em}.bbl.md-content h3{font-size:.95em}
-.bbl.md-content p{margin:.4em 0;line-height:1.65}
-.bbl.md-content ul,.bbl.md-content ol{padding-left:1.4em;margin:.4em 0}
-.bbl.md-content li{margin:.2em 0;line-height:1.6}
-.bbl.md-content table{border-collapse:collapse;width:100%;margin:.6em 0;font-size:.85em}
-.bbl.md-content th,.bbl.md-content td{border:1px solid var(--bd2);padding:6px 10px;text-align:left}
+.bbl.md-content h1,.bbl.md-content h2,.bbl.md-content h3{font-weight:600;margin:0 0 .2em;line-height:1.3}
+.bbl.md-content h1{font-size:1.05em}.bbl.md-content h2{font-size:.98em}.bbl.md-content h3{font-size:.92em}
+.bbl.md-content p{margin:0 0 .3em;line-height:1.5}
+.bbl.md-content ul,.bbl.md-content ol{padding-left:1.2em;margin:0 0 .2em}
+.bbl.md-content li{margin:.1em 0;line-height:1.5}
+.bbl.md-content table{border-collapse:collapse;width:100%;margin:.4em 0;font-size:.85em}
+.bbl.md-content th,.bbl.md-content td{border:1px solid var(--bd2);padding:5px 8px;text-align:left}
 .bbl.md-content th{background:var(--bg3);font-weight:600;color:var(--tx)}
 .bbl.md-content td{background:var(--bg2);color:var(--tx2)}
 .bbl.md-content tr:hover td{background:var(--bg3)}
 .bbl.md-content code{background:var(--bg3);border:1px solid var(--bd);border-radius:4px;padding:1px 5px;font-family:var(--f1);font-size:.85em;color:var(--ac2)}
-.bbl.md-content pre{background:var(--bg0);border:1px solid var(--bd);border-radius:8px;padding:10px 12px;overflow-x:auto;margin:.5em 0}
+.bbl.md-content pre{background:var(--bg0);border:1px solid var(--bd);border-radius:8px;padding:8px 10px;overflow-x:auto;margin:.3em 0}
 .bbl.md-content pre code{background:none;border:none;padding:0;font-size:.82em;color:var(--tx)}
-.bbl.md-content blockquote{border-left:3px solid var(--ac);padding:.3em .8em;margin:.4em 0;color:var(--tx2);background:var(--bg2);border-radius:0 6px 6px 0}
+.bbl.md-content blockquote{border-left:3px solid var(--ac);padding:.2em .6em;margin:.3em 0;color:var(--tx2);background:var(--bg2);border-radius:0 4px 4px 0}
 .bbl.md-content strong{font-weight:600;color:var(--tx)}
 .bbl.md-content em{font-style:italic;color:var(--tx2)}
-.bbl.md-content hr{border:none;border-top:1px solid var(--bd);margin:.6em 0}
+.bbl.md-content hr{border:none;border-top:1px solid var(--bd);margin:.4em 0}
 .bbl.md-content a{color:var(--ac2);text-decoration:underline}
+.bbl.md-content br{display:block;margin:0;line-height:1.2}
 :root{
   --bg0:#09090b;--bg1:#111115;--bg2:#18181c;--bg3:#222228;
   --bd:#2e2e36;--bd2:#3a3a44;
@@ -742,12 +743,19 @@ function addBbl(role,content,time=''){
   }
   const u=role==='user';
   const av=u?`<div class="av user">👤</div>`:`<div class="av ai">🤖</div>`;
-  // User: escape HTML thuần | AI: render markdown
+  // User: escape HTML thuần | AI: render markdown (loc bo dong trong thua)
+  let cleanContent = content;
+  if(!u){
+    // Loai bo 3+ dong trong lien tiep, giu lai 1 dong
+    cleanContent = content.replace(/\n{3,}/g, '\n\n');
+    // Loai bo space thua o dau cuoi dong
+    cleanContent = cleanContent.split('\n').map(l=>l.trimEnd()).join('\n');
+  }
   const rendered = u
-    ? esc(content)
+    ? esc(cleanContent)
     : (typeof marked !== 'undefined'
-        ? marked.parse(content, {breaks:true, gfm:true})
-        : esc(content));
+        ? marked.parse(cleanContent, {breaks:true, gfm:true})
+        : esc(cleanContent));
   const mdClass = u ? '' : ' md-content';
   m.innerHTML+=`<div class="mrow ${u?'user':'ai'}">${u?'':av}
     <div><div class="bbl${mdClass}">${rendered}</div>${time?`<div class="msg-t">${time}</div>`:''}</div>
