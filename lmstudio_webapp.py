@@ -365,6 +365,11 @@ select.sel:focus{border-color:var(--ac)}
 .hi:hover{background:var(--bg2);color:var(--tx)}
 .hi.active{background:var(--bg3);color:var(--tx);border-color:var(--bd2)}
 .hi-time{font-size:.67rem;color:var(--tx3);margin-top:1px}
+.hi{display:flex;align-items:center;justify-content:space-between}
+.hi-content{flex:1;overflow:hidden}
+.hi-del{opacity:0;width:20px;height:20px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:.7rem;color:var(--tx3);cursor:pointer;transition:all .15s;flex-shrink:0;margin-left:4px}
+.hi:hover .hi-del{opacity:1}
+.hi-del:hover{background:var(--rd);color:#fff}
 .h-empty{padding:24px 12px;text-align:center;color:var(--tx3);font-size:.8rem;line-height:1.6}
 .main{flex:1;overflow:hidden;display:flex;flex-direction:column}
 .panel{display:none;flex:1;overflow:hidden;flex-direction:column;animation:fi .18s ease}
@@ -694,7 +699,9 @@ function renderHistory(ss){
     items.forEach(s=>{
       const ac=s.id===curSid?'active':'';
       el.innerHTML+=`<div class="hi ${ac}" onclick="loadSess('${s.id}')" title="${esc(s.title)}">
-        ${esc(s.title)}<div class="hi-time">${(s.updated_at||'').slice(11,16)}</div></div>`;
+        <div class="hi-content">${esc(s.title)}<div class="hi-time">${(s.updated_at||'').slice(11,16)}</div></div>
+        <span class="hi-del" onclick="event.stopPropagation();delSess('${s.id}')" title="Xóa">✕</span>
+      </div>`;
     });
   }
 }
@@ -714,6 +721,15 @@ async function loadSess(id){
     $('chat-msgs').innerHTML='';
     d.messages.forEach(m=>addBbl(m.role,m.content,(m.created_at||'').slice(11,16)));
     $('chat-msgs').scrollTop=$('chat-msgs').scrollHeight;
+    await loadHistory();
+  }catch(e){ console.error(e); }
+}
+
+async function delSess(id){
+  if(!confirm('Xóa cuộc trò chuyện này? Không thể hoàn tác.')) return;
+  try{
+    await fetch(`/api/sessions/${id}`,{method:'DELETE'});
+    if(curSid===id){ curSid=null; chatMsgs=[]; $('chat-msgs').innerHTML='<div class="mrow sys"><div class="bbl">Cuộc trò chuyện đã xóa. Nhấn ✏️ để bắt đầu mới.</div></div>'; }
     await loadHistory();
   }catch(e){ console.error(e); }
 }
@@ -944,7 +960,7 @@ def api_chat():
     else:
         msgs.append({"role": "user", "content": user_msg})
 
-    reply = llm_call(msgs, d, max_tokens=8192, temperature=0.7)
+    reply = llm_call(msgs, d, max_tokens=4096, temperature=0.7)
 
     if sid:
         ts = now_str()
