@@ -24,6 +24,7 @@ Deploy Render (dung Turso):
     OPENROUTER_API_KEY = sk-or-...
     APP_PASSWORD   = matkhau  (tuy chon)
 """
+
 from flask import Flask, request, jsonify, Response
 from openai import OpenAI
 import json, os, re, sqlite3, uuid
@@ -47,8 +48,7 @@ PROVIDERS = {
     "groq":       {"name": "Groq (Cloud - Fast)",      "base_url": "https://api.groq.com/openai/v1",  "api_key": GROQ_API_KEY,       "default_model": "llama3-70b-8192"},
     "openrouter": {"name": "OpenRouter (Multi-Model)", "base_url": "https://openrouter.ai/api/v1",    "api_key": OPENROUTER_API_KEY, "default_model": "google/gemini-pro-1.5"},
 }
-
-# ===== DATABASE (TURSO / SQLITE SYNC FIX) =====
+# ===== DATABASE - tu dong chon SQLite hoac Turso =====
 TURSO_URL   = os.environ.get("TURSO_URL", "").strip()
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "").strip()
 USE_TURSO   = bool(TURSO_URL and TURSO_TOKEN)
@@ -66,6 +66,8 @@ _CREATE_MESSAGES_TURSO = """CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
     role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL)"""
 
+
+# --- SQLite (local) ---
 _db_path = Path(os.environ.get("DB_PATH", "") or (Path(__file__).parent / "chat_history.db"))
 
 def _sqlite_conn():
@@ -80,32 +82,45 @@ def _sqlite_init():
         c.execute(_CREATE_MESSAGES_SQLITE)
         c.commit()
 
-def _get_turso_url():
-    url = TURSO_URL
-    if url.startswith("libsql://"):
-        url = url.replace("libsql://", "https://")
-    return url
 
-def init_db():
-    if USE_TURSO:
+# --- Turso (cloud) ---
+_turso_client = None
+
+def _get_turso():
+    global _turso_client
+    if _turso_client is None:
         try:
             import libsql_client
-            # Dùng 'with' để tự động mở và đóng kết nối -> Chống kẹt worker trên Render
-            with libsql_client.create_client_sync(url=_get_turso_url(), auth_token=TURSO_TOKEN) as c:
-                c.execute(_CREATE_SESSIONS)
-                c.execute(_CREATE_MESSAGES_TURSO)
-            print(f"  DB : Turso cloud ({TURSO_URL})")
-        except Exception as e:
-            print(f"  Turso Init Error: {e}")
+            _turso_client = libsql_client.create_client_sync(
+                url=TURSO_URL, auth_token=TURSO_TOKEN)
+        except ImportError:
+            raise RuntimeError(
+                "Thu vien libsql-client chua duoc cai.\n"
+                "Chay: pip install libsql-client")
+    return _turso_client
+
+def _turso_init():
+    c = _get_turso()
+    c.execute(_CREATE_SESSIONS)
+    c.execute(_CREATE_MESSAGES_TURSO)
+
+def _turso_rows(result):
+    cols = [col.name for col in result.columns] if result.columns else []
+    return [dict(zip(cols, row)) for row in (result.rows or [])]
+
+
+# --- Interface thong nhat (dung cho ca SQLite va Turso) ---
+def init_db():
+    if USE_TURSO:
+        _turso_init()
+        print(f"  DB : Turso cloud ({TURSO_URL})")
     else:
         _sqlite_init()
         print(f"  DB : SQLite ({_db_path})")
 
 def db_execute(sql, params=()):
     if USE_TURSO:
-        import libsql_client
-        with libsql_client.create_client_sync(url=_get_turso_url(), auth_token=TURSO_TOKEN) as c:
-            c.execute(sql, list(params))
+        _get_turso().execute(sql, list(params))
     else:
         with _sqlite_conn() as c:
             c.execute(sql, params)
@@ -113,11 +128,8 @@ def db_execute(sql, params=()):
 
 def db_fetchall(sql, params=()):
     if USE_TURSO:
-        import libsql_client
-        with libsql_client.create_client_sync(url=_get_turso_url(), auth_token=TURSO_TOKEN) as c:
-            result = c.execute(sql, list(params))
-            cols = [col.name for col in result.columns] if result.columns else []
-            return [dict(zip(cols, row)) for row in (result.rows or [])]
+        result = _get_turso().execute(sql, list(params))
+        return _turso_rows(result)
     else:
         with _sqlite_conn() as c:
             rows = c.execute(sql, params).fetchall()
@@ -127,7 +139,7 @@ def db_fetchone(sql, params=()):
     rows = db_fetchall(sql, params)
     return rows[0] if rows else None
 
-# Khởi tạo DB khi chạy
+# Chay ngay khi module load (can cho gunicorn/Render)
 init_db()
 
 # ===== AUTH =====
@@ -138,7 +150,7 @@ def check_login():
         if not auth or auth.password != APP_PASSWORD:
             return Response('Nhập mật khẩu để tiếp tục.', 401, {'WWW-Authenticate': 'Basic realm="AI Apps"'})
 
-# ===== HELPERS & RATE LIMITER =====
+# ===== HELPERS =====
 def get_client(provider_key="lmstudio"):
     cfg = PROVIDERS.get(provider_key, PROVIDERS["lmstudio"])
     return OpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"])
@@ -150,19 +162,21 @@ def parse_reply(content):
         text = text.replace(tok, "")
     return text.strip()
 
+# ===== GROQ RATE LIMITER =====
+# Groq free: 8000 tokens/phut, 30 req/phut
 import threading, time as _time
 _groq_lock     = threading.Lock()
 _groq_tokens   = 0
 _groq_reqs     = 0
 _groq_reset_at = 0.0
-GROQ_MAX_TPM   = 7500   
+GROQ_MAX_TPM   = 7500   # gia tri an toan duoi gioi han 8000
 GROQ_MAX_RPM   = 28
 
 def _groq_wait(estimated_tokens=500):
     global _groq_tokens, _groq_reqs, _groq_reset_at
     with _groq_lock:
         now = _time.time()
-        if now >= _groq_reset_at:
+        if now >= _groq_reset_at:           # Reset moi phut
             _groq_tokens   = 0
             _groq_reqs     = 0
             _groq_reset_at = now + 60.0
@@ -171,13 +185,15 @@ def _groq_wait(estimated_tokens=500):
             wait = max(wait, _groq_reset_at - now)
         if _groq_reqs >= GROQ_MAX_RPM:
             wait = max(wait, _groq_reset_at - now)
-        if wait > 0: print(f"  [Groq RL] chờ {wait:.1f}s")
+        if wait > 0:
+            print(f"  [Groq RL] cho {wait:.1f}s (tokens={_groq_tokens}, reqs={_groq_reqs})")
         _groq_tokens += estimated_tokens
         _groq_reqs   += 1
-    if wait > 0: _time.sleep(wait)
+    if wait > 0:
+        _time.sleep(wait)
 
 def _estimate_tokens(messages):
-    return sum(len(m.get("content","")) // 3 for m in messages if isinstance(m.get("content"), str)) + 200
+    return sum(len(m.get("content","")) // 3 for m in messages) + 200
 
 def llm_call(messages, d, max_tokens=1024, temperature=0.7):
     try:
@@ -197,7 +213,8 @@ def llm_call(messages, d, max_tokens=1024, temperature=0.7):
                     model=d.get('model') or PROVIDERS[d.get('provider')]["default_model"],
                     messages=messages, max_tokens=max_tokens, temperature=temperature)
                 return parse_reply(resp.choices[0].message.content or "")
-            except Exception as e2: return f"Lỗi sau retry: {str(e2)}"
+            except Exception as e2:
+                return f"Lỗi sau retry: {str(e2)}"
         return f"Lỗi API: {err}"
 
 # ===== FILE PROCESSING =====
@@ -207,37 +224,30 @@ ALLOWED_EXT = {'.txt','.md','.py','.js','.ts','.json','.csv','.html','.css',
                '.xml','.yaml','.yml','.ini','.sh','.bat','.sql','.log',
                '.pdf','.png','.jpg','.jpeg','.gif','.webp'}
 MAX_FILE_MB  = 5
-MAX_TEXT_CHARS = 12000
+MAX_TEXT_CHARS = 12000   # cat ngan neu qua dai
 
 def _read_file_content(file_storage):
+    """Doc noi dung file, tra ve (text|None, mime_type, ten_file)."""
     fname = file_storage.filename or "file"
     ext   = os.path.splitext(fname)[1].lower()
-    if ext not in ALLOWED_EXT: return None, None, fname
+    if ext not in ALLOWED_EXT:
+        return None, None, fname
     data  = file_storage.read()
-    if len(data) > MAX_FILE_MB * 1024 * 1024: return None, "too_large", fname
+    if len(data) > MAX_FILE_MB * 1024 * 1024:
+        return None, "too_large", fname
     mime  = mimetypes.guess_type(fname)[0] or "application/octet-stream"
-    
+    # File van ban
     if mime.startswith("text/") or ext in {'.py','.js','.ts','.json','.csv',
             '.xml','.yaml','.yml','.ini','.sh','.bat','.sql','.log','.md'}:
         try:
             text = data.decode("utf-8", errors="replace")
             return text[:MAX_TEXT_CHARS], "text", fname
-        except: return None, None, fname
-        
+        except:
+            return None, None, fname
+    # File anh
     if mime.startswith("image/"):
         b64 = base64.b64encode(data).decode()
         return b64, mime, fname
-        
-    # PDF parsing (Cần pypdf)
-    if ext == '.pdf':
-        try:
-            import io
-            from pypdf import PdfReader
-            pdf = PdfReader(io.BytesIO(data))
-            text = "\n".join([page.extract_text() for page in pdf.pages])
-            return text[:MAX_TEXT_CHARS], "text", fname
-        except Exception: return None, None, fname
-        
     return None, None, fname
 
 def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -914,7 +924,7 @@ def api_chat():
 def api_optimize():
     d=request.json
     r=llm_call([{"role":"system","content":"Bạn là chuyên gia Prompt Engineering. Viết lại thành prompt chuyên nghiệp, chi tiết. Chỉ trả về prompt, không giải thích."},
-                {"role":"user","content":f"Yêu cầu: {d['text']}"}],d,max_tokens=1024,temperature=0.5)
+                {"role":"user","content":f"Yêu cầu: {d['text']}"}],d,max_tokens=2048,temperature=0.5)
     return jsonify({"result":r})
 
 @app.route('/api/translate', methods=['POST'])
