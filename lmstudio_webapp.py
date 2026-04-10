@@ -42,13 +42,13 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 app = Flask(__name__)
 
 PROVIDERS = {
-    "lmstudio":   {"name": "LM Studio (Local)",       "base_url": f"{LM_STUDIO_URL}/v1",             "api_key": "lm-studio",        "default_model": "local-model"},
-    "ollama_cloud":     {"name": "Ollama (Cloud)",          "base_url": "https://ollama.com/api/v1",                "api_key": "OLLAMA_API_KEY",    "default_model": "minimax-m2.7:cloud"},
-    "groq":       {"name": "Groq (Cloud - Fast)",      "base_url": "https://api.groq.com/openai/v1",  "api_key": GROQ_API_KEY,       "default_model": "llama3-70b-8192"},
-    "openrouter": {"name": "OpenRouter (Multi-Model)", "base_url": "https://openrouter.ai/api/v1",    "api_key": OPENROUTER_API_KEY, "default_model": "google/gemini-pro-1.5"},
-    "gemini":     {"name": "Gemini", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",    "api_key": GEMINI_API_KEY, "default_model": "Gemma 4 31B"},
-    "deepSeek":   {"name": "DeepSeek", "base_url": "https://api.deepseek.com/v1",    "api_key": DEEPSEEK_API_KEY, "default_model": "deepseek-chat"},
-    "grok":       {"name": "Grok", "base_url": "https://api.x.ai/v1",    "api_key": XAI_API_KEY, "default_model": "grok-4.20-reasoning-latest"},
+    "lmstudio":    {"name": "LM Studio (Local)",       "base_url": f"{LM_STUDIO_URL}/v1",                          "api_key": "lm-studio",        "default_model": "local-model"},
+    "ollama_cloud": {"name": "Ollama (Cloud)",          "base_url": "https://api.ollama.com/v1",                     "api_key": OLLAMA_API_KEY,      "default_model": "minimax-m2.7:cloud"},
+    "groq":        {"name": "Groq (Cloud - Fast)",      "base_url": "https://api.groq.com/openai/v1",               "api_key": GROQ_API_KEY,        "default_model": "llama3-70b-8192"},
+    "openrouter":  {"name": "OpenRouter (Multi-Model)", "base_url": "https://openrouter.ai/api/v1",                  "api_key": OPENROUTER_API_KEY,  "default_model": "google/gemini-pro-1.5"},
+    "gemini":      {"name": "Gemini",                   "base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "api_key": GEMINI_API_KEY,  "default_model": "Gemma 4 31B"},
+    "deepSeek":    {"name": "DeepSeek",                 "base_url": "https://api.deepseek.com/v1",                   "api_key": DEEPSEEK_API_KEY,    "default_model": "deepseek-chat"},
+    "grok":        {"name": "Grok",                     "base_url": "https://api.x.ai/v1",                           "api_key": XAI_API_KEY,         "default_model": "grok-4.20-reasoning-latest"},
 }
 
 # ===== DATABASE =====
