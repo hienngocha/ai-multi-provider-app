@@ -1,62 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-lmstudio_webapp.py - v2.2
+lmstudio_webapp.py - v2.4 (Templates, Code Highlight, Export, Auto-title)
 ==========================
 Web app AI voi giao dien moi + luu lich su chat.
-
-Database:
-  - Local / LAN : SQLite (mac dinh, khong can cai them)
-  - Render cloud: Turso (libSQL cloud, mien phi 5GB)
-
-Cai dat:
-  pip install flask openai
-  pip install requests         # Da co san trong flask, khong can cai them
-
-Chay local:
-  python lmstudio_webapp.py
-
-Deploy Render (dung Turso):
-  Bien moi truong can set:
-    TURSO_URL      = libsql://ten-db.turso.io
-    TURSO_TOKEN    = eyJhbGci...
-    GROQ_API_KEY   = gsk_...
-    OPENROUTER_API_KEY = sk-or-...
-    APP_PASSWORD   = matkhau  (tuy chon)
 """
 
 from flask import Flask, request, jsonify, Response
 from openai import OpenAI
-import json, os, re, sqlite3, uuid
+import json, os, re, sqlite3, uuid, threading
 from datetime import datetime
 from pathlib import Path
-from google import genai
+
 # ===== CONFIG =====
 try:
-    from config import LM_STUDIO_URL, REQUEST_TIMEOUT, GROQ_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY
+    from config import LM_STUDIO_URL, REQUEST_TIMEOUT, GROQ_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, DEEPSEEK_API_KEY, XAI_API_KEY, OLLAMA_API_KEY
 except ImportError:
     LM_STUDIO_URL      = "http://127.0.0.1:1234"
     REQUEST_TIMEOUT    = 120
     GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+    GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
+    OLLAMA_API_KEY     = os.environ.get("OLLAMA_API_KEY", "")
+    DEEPSEEK_API_KEY   = os.environ.get("DEEPSEEK_API_KEY", "")
+    XAI_API_KEY        = os.environ.get("XAI_API_KEY", "")
 
-# Thêm dòng này cho Ollama (Mặc định Ollama chạy port 11434)
-#OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 app = Flask(__name__)
 PROVIDERS = {
     "lmstudio":   {"name": "LM Studio (Local)",       "base_url": f"{LM_STUDIO_URL}/v1",             "api_key": "lm-studio",        "default_model": "local-model"},
-#    "ollama":     {"name": "Ollama (Local)",          "base_url": f"{OLLAMA_URL}/v1",                "api_key": "ollama",           "default_model": ""},
-#    "ollama_cloud":     {"name": "Ollama (Cloud)",          "base_url": "https://ollama.com/api/v1",                "api_key": "OLLAMA_API_KEY",    "default_model": "minimax-m2.7:cloud"},
+    "ollama":     {"name": "Ollama (Local)",          "base_url": f"{OLLAMA_URL}/v1",                "api_key": "ollama",           "default_model": ""},
     "groq":       {"name": "Groq (Cloud - Fast)",      "base_url": "https://api.groq.com/openai/v1",  "api_key": GROQ_API_KEY,       "default_model": "llama3-70b-8192"},
     "openrouter": {"name": "OpenRouter (Multi-Model)", "base_url": "https://openrouter.ai/api/v1",    "api_key": OPENROUTER_API_KEY, "default_model": "google/gemini-pro-1.5"},
     "gemini":     {"name": "Gemini", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",    "api_key": GEMINI_API_KEY, "default_model": "Gemma 4 31B"},
+    "deepSeek":   {"name": "DeepSeek", "base_url": "https://api.deepseek.com/v1",    "api_key": DEEPSEEK_API_KEY, "default_model": "deepseek-chat"},
+    "grok":       {"name": "Grok", "base_url": "https://api.x.ai/v1",    "api_key": XAI_API_KEY, "default_model": "grok-4.20-reasoning-latest"},
 }
 
 # ===== DATABASE =====
-# Tu dong chon: Turso HTTP API (cloud) hoac SQLite (local)
-# Turso HTTP API: khong dung asyncio, tuong thich gunicorn sync worker
 TURSO_URL   = os.environ.get("TURSO_URL", "").strip()
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "").strip()
 USE_TURSO   = bool(TURSO_URL and TURSO_TOKEN)
@@ -70,51 +52,28 @@ _CREATE_MESSAGES = """CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
     role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL)"""
 
+_CREATE_TEMPLATES = """CREATE TABLE IF NOT EXISTS templates (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, prompt TEXT NOT NULL)"""
 
-# ── Turso HTTP API (dung requests, khong asyncio) ──
 import requests as _req
 
 def _turso_http(sql, params=()):
-    """
-    Goi Turso qua HTTP API.
-    Tra ve list of dict, hoac [] neu khong co ket qua.
-    Turso HTTP endpoint: POST /v2/pipeline
-    """
-    # Chuyen params thanh dung dinh dang Turso mong doi
     args = []
     for p in params:
-        if p is None:
-            args.append({"type": "null"})
-        elif isinstance(p, int):
-            args.append({"type": "integer", "value": str(p)})
-        elif isinstance(p, float):
-            args.append({"type": "float", "value": str(p)})
-        else:
-            args.append({"type": "text", "value": str(p)})
+        if p is None: args.append({"type": "null"})
+        elif isinstance(p, int): args.append({"type": "integer", "value": str(p)})
+        elif isinstance(p, float): args.append({"type": "float", "value": str(p)})
+        else: args.append({"type": "text", "value": str(p)})
 
-    # Turso URL co the dang https:// hoac libsql://
-    # HTTP API can dung https://
     base_url = TURSO_URL.replace("libsql://", "https://")
     endpoint = f"{base_url}/v2/pipeline"
-    headers  = {
-        "Authorization": f"Bearer {TURSO_TOKEN}",
-        "Content-Type":  "application/json",
-    }
-    payload = {
-        "requests": [
-            {"type": "execute", "stmt": {"sql": sql, "args": args}},
-            {"type": "close"}
-        ]
-    }
+    headers  = {"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type":  "application/json"}
+    payload = {"requests": [{"type": "execute", "stmt": {"sql": sql, "args": args}}, {"type": "close"}]}
     resp = _req.post(endpoint, json=payload, headers=headers, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-
-    # Parse ket qua
     result = data.get("results", [{}])[0]
-    if result.get("type") == "error":
-        raise Exception(f"Turso error: {result.get('error', {}).get('message', 'unknown')}")
-
+    if result.get("type") == "error": raise Exception(f"Turso error: {result.get('error', {}).get('message', 'unknown')}")
     rows_data = result.get("response", {}).get("result", {})
     cols  = [c.get("name") for c in rows_data.get("cols", [])]
     rows  = rows_data.get("rows", [])
@@ -122,21 +81,14 @@ def _turso_http(sql, params=()):
     for row in rows:
         vals = []
         for cell in row:
-            t = cell.get("type", "null")
-            v = cell.get("value")
-            if t == "null" or v is None:
-                vals.append(None)
-            elif t == "integer":
-                vals.append(int(v))
-            elif t == "float":
-                vals.append(float(v))
-            else:
-                vals.append(v)
+            t = cell.get("type", "null"); v = cell.get("value")
+            if t == "null" or v is None: vals.append(None)
+            elif t == "integer": vals.append(int(v))
+            elif t == "float": vals.append(float(v))
+            else: vals.append(v)
         out.append(dict(zip(cols, vals)))
     return out
 
-
-# ── SQLite local ──
 _db_path = Path(os.environ.get("DB_PATH", "") or (Path(__file__).parent / "chat_history.db"))
 
 def _sqlite_conn():
@@ -144,47 +96,39 @@ def _sqlite_conn():
     c.row_factory = sqlite3.Row
     return c
 
-
-# ── Interface thong nhat ──
 def init_db():
     if USE_TURSO:
-        _turso_http(_CREATE_SESSIONS)
-        _turso_http(_CREATE_MESSAGES)
-        print(f"  DB : Turso HTTP API ({TURSO_URL})")
+        _turso_http(_CREATE_SESSIONS); _turso_http(_CREATE_MESSAGES); _turso_http(_CREATE_TEMPLATES)
     else:
         _db_path.parent.mkdir(parents=True, exist_ok=True)
         with _sqlite_conn() as c:
             c.execute(_CREATE_SESSIONS)
-            c.execute(_CREATE_MESSAGES.replace(
-                "INTEGER PRIMARY KEY",
-                "INTEGER PRIMARY KEY AUTOINCREMENT"))
+            c.execute(_CREATE_MESSAGES.replace("INTEGER PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT"))
+            c.execute(_CREATE_TEMPLATES)
             c.commit()
-        print(f"  DB : SQLite ({_db_path})")
+            # Seed default templates
+            cnt = c.execute("SELECT COUNT(*) as c FROM templates").fetchone()['c']
+            if cnt == 0:
+                c.execute("INSERT INTO templates VALUES (?,?,?)", ("t1", "Dịch giả chuyên nghiệp", "Bạn là một dịch giả xuất sắc. Hãy dịch thuật chính xác, giữ nguyên các tag code nếu có."))
+                c.execute("INSERT INTO templates VALUES (?,?,?)", ("t2", "Lập trình viên Senior", "Bạn là một kĩ sư phần mềm Senior. Trả lời ngắn gọn, tối ưu code và luôn giải thích logic."))
+                c.commit()
 
 def db_execute(sql, params=()):
-    if USE_TURSO:
-        _turso_http(sql, params)
+    if USE_TURSO: _turso_http(sql, params)
     else:
-        with _sqlite_conn() as c:
-            c.execute(sql, params)
-            c.commit()
+        with _sqlite_conn() as c: c.execute(sql, params); c.commit()
 
 def db_fetchall(sql, params=()):
-    if USE_TURSO:
-        return _turso_http(sql, params)
+    if USE_TURSO: return _turso_http(sql, params)
     else:
-        with _sqlite_conn() as c:
-            rows = c.execute(sql, params).fetchall()
-            return [dict(r) for r in rows]
+        with _sqlite_conn() as c: return [dict(r) for r in c.execute(sql, params).fetchall()]
 
 def db_fetchone(sql, params=()):
     rows = db_fetchall(sql, params)
     return rows[0] if rows else None
 
-# Chay ngay khi module load (can cho gunicorn/Render)
 init_db()
 
-# ===== AUTH =====
 @app.before_request
 def check_login():
     if APP_PASSWORD:
@@ -192,7 +136,6 @@ def check_login():
         if not auth or auth.password != APP_PASSWORD:
             return Response('Nhập mật khẩu để tiếp tục.', 401, {'WWW-Authenticate': 'Basic realm="AI Apps"'})
 
-# ===== HELPERS =====
 def get_client(provider_key="lmstudio"):
     cfg = PROVIDERS.get(provider_key, PROVIDERS["lmstudio"])
     return OpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"])
@@ -200,96 +143,84 @@ def get_client(provider_key="lmstudio"):
 def parse_reply(content):
     if not content: return ""
     text = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
-    for tok in ["<|END_RESPONSE|>","<|end_of_turn|>","<|eot_id|>","<|endoftext|>","<|im_end|>"]:
-        text = text.replace(tok, "")
+    for tok in ["<|END_RESPONSE|>","<|end_of_turn|>","<|eot_id|>","<|endoftext|>","<|im_end|>"]: text = text.replace(tok, "")
     return text.strip()
 
-# ===== GROQ RATE LIMITER =====
-# Groq free: 8000 tokens/phut, 30 req/phut
-import threading, time as _time
 _groq_lock     = threading.Lock()
-_groq_tokens   = 0
-_groq_reqs     = 0
-_groq_reset_at = 0.0
-GROQ_MAX_TPM   = 7500   # gia tri an toan duoi gioi han 8000
-GROQ_MAX_RPM   = 28
+_groq_tokens   = 0; _groq_reqs     = 0; _groq_reset_at = 0.0
+GROQ_MAX_TPM   = 7500; GROQ_MAX_RPM   = 28
+import time as _time
 
 def _groq_wait(estimated_tokens=500):
     global _groq_tokens, _groq_reqs, _groq_reset_at
     with _groq_lock:
         now = _time.time()
-        if now >= _groq_reset_at:           # Reset moi phut
-            _groq_tokens   = 0
-            _groq_reqs     = 0
-            _groq_reset_at = now + 60.0
+        if now >= _groq_reset_at: _groq_tokens = 0; _groq_reqs = 0; _groq_reset_at = now + 60.0
         wait = 0.0
-        if _groq_tokens + estimated_tokens > GROQ_MAX_TPM:
-            wait = max(wait, _groq_reset_at - now)
-        if _groq_reqs >= GROQ_MAX_RPM:
-            wait = max(wait, _groq_reset_at - now)
-        if wait > 0:
-            print(f"  [Groq RL] cho {wait:.1f}s (tokens={_groq_tokens}, reqs={_groq_reqs})")
-        _groq_tokens += estimated_tokens
-        _groq_reqs   += 1
-    if wait > 0:
-        _time.sleep(wait)
+        if _groq_tokens + estimated_tokens > GROQ_MAX_TPM: wait = max(wait, _groq_reset_at - now)
+        if _groq_reqs >= GROQ_MAX_RPM: wait = max(wait, _groq_reset_at - now)
+        _groq_tokens += estimated_tokens; _groq_reqs += 1
+    if wait > 0: _time.sleep(wait)
 
-def _estimate_tokens(messages):
-    return sum(len(m.get("content","")) // 3 for m in messages) + 200
+def _estimate_tokens(messages): return sum(len(m.get("content","")) // 3 for m in messages) + 200
 
 def llm_call(messages, d, max_tokens=1024, temperature=0.7):
     try:
         provider = d.get('provider', 'lmstudio')
         model    = d.get('model') or PROVIDERS[provider]["default_model"]
-        if provider == 'groq':
-            _groq_wait(_estimate_tokens(messages) + max_tokens)
-        resp = get_client(provider).chat.completions.create(
-            model=model, messages=messages, max_tokens=max_tokens, temperature=temperature)
-        return parse_reply(resp.choices[0].message.content or "")
+        if provider == 'groq': _groq_wait(_estimate_tokens(messages) + max_tokens)
+        resp = get_client(provider).chat.completions.create(model=model, messages=messages, max_tokens=max_tokens, temperature=temperature)
+        res = parse_reply(resp.choices[0].message.content or "")
+        return res if res else "(LLM trả về rỗng. Vui lòng thử lại hoặc giảm System Prompt)"
     except Exception as e:
-        err = str(e)
-        if '429' in err and 'groq' in d.get('provider',''):
-            _time.sleep(15)
-            try:
-                resp = get_client(d.get('provider')).chat.completions.create(
-                    model=d.get('model') or PROVIDERS[d.get('provider')]["default_model"],
-                    messages=messages, max_tokens=max_tokens, temperature=temperature)
-                return parse_reply(resp.choices[0].message.content or "")
-            except Exception as e2:
-                return f"Lỗi sau retry: {str(e2)}"
-        return f"Lỗi API: {err}"
+        return f"Lỗi API: {str(e)}"
 
-# ===== FILE PROCESSING =====
+def llm_call_stream(messages, d, max_tokens=4096, temperature=0.7):
+    try:
+        provider = d.get('provider', 'lmstudio')
+        model    = d.get('model') or PROVIDERS[provider]["default_model"]
+        if provider == 'groq': _groq_wait(_estimate_tokens(messages) + max_tokens)
+        stream = get_client(provider).chat.completions.create(model=model, messages=messages, max_tokens=max_tokens, temperature=temperature, stream=True)
+        _STOP_TOKS = ["<|END_RESPONSE|>","<|end_of_turn|>","<|eot_id|>","<|endoftext|>","<|im_end|>"]
+        buf = ""; in_think = False
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content if chunk.choices else None
+            if not delta: continue
+            buf += delta
+            while True:
+                if in_think:
+                    end = buf.find("</think>")
+                    if end == -1: buf = ""; break
+                    else: buf = buf[end + 8:]; in_think = False
+                else:
+                    start = buf.find("<think>")
+                    if start == -1: break
+                    yield buf[:start]; buf = buf[start + 7:]; in_think = True
+            if not in_think:
+                clean = buf
+                for tok in _STOP_TOKS: clean = clean.replace(tok, "")
+                if clean: yield clean; buf = ""
+        if buf and not in_think:
+            for tok in _STOP_TOKS: buf = buf.replace(tok, "")
+            if buf: yield buf
+    except Exception as e:
+        yield f"\n\n❌ Lỗi streaming: {str(e)}"
+
 import base64, mimetypes
-
-ALLOWED_EXT = {'.txt','.md','.py','.js','.ts','.json','.csv','.html','.css',
-               '.xml','.yaml','.yml','.ini','.sh','.bat','.sql','.log',
-               '.pdf','.png','.jpg','.jpeg','.gif','.webp'}
-MAX_FILE_MB  = 5
-MAX_TEXT_CHARS = 12000   # cat ngan neu qua dai
+ALLOWED_EXT = {'.txt','.md','.py','.js','.ts','.json','.csv','.html','.css','.xml','.yaml','.yml','.ini','.sh','.bat','.sql','.log','.pdf','.png','.jpg','.jpeg','.gif','.webp'}
+MAX_FILE_MB  = 5; MAX_TEXT_CHARS = 12000
 
 def _read_file_content(file_storage):
-    """Doc noi dung file, tra ve (text|None, mime_type, ten_file)."""
     fname = file_storage.filename or "file"
     ext   = os.path.splitext(fname)[1].lower()
-    if ext not in ALLOWED_EXT:
-        return None, None, fname
+    if ext not in ALLOWED_EXT: return None, None, fname
     data  = file_storage.read()
-    if len(data) > MAX_FILE_MB * 1024 * 1024:
-        return None, "too_large", fname
+    if len(data) > MAX_FILE_MB * 1024 * 1024: return None, "too_large", fname
     mime  = mimetypes.guess_type(fname)[0] or "application/octet-stream"
-    # File van ban
-    if mime.startswith("text/") or ext in {'.py','.js','.ts','.json','.csv',
-            '.xml','.yaml','.yml','.ini','.sh','.bat','.sql','.log','.md'}:
-        try:
-            text = data.decode("utf-8", errors="replace")
-            return text[:MAX_TEXT_CHARS], "text", fname
-        except:
-            return None, None, fname
-    # File anh
-    if mime.startswith("image/"):
-        b64 = base64.b64encode(data).decode()
-        return b64, mime, fname
+    if mime.startswith("text/") or ext in {'.py','.js','.ts','.json','.csv','.xml','.yaml','.yml','.ini','.sh','.bat','.sql','.log','.md'}:
+        try: return data.decode("utf-8", errors="replace")[:MAX_TEXT_CHARS], "text", fname
+        except: return None, None, fname
+    if mime.startswith("image/"): return base64.b64encode(data).decode(), mime, fname
     return None, None, fname
 
 def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -302,27 +233,10 @@ HTML = r"""<!DOCTYPE html>
 <title>AI Apps</title>
 <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500&family=Geist:wght@300;400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <style>
-/* Markdown rendering trong bubble chat */
-.bbl.md-content h1,.bbl.md-content h2,.bbl.md-content h3{font-weight:600;margin:0 0 .2em;line-height:1.3}
-.bbl.md-content h1{font-size:1.05em}.bbl.md-content h2{font-size:.98em}.bbl.md-content h3{font-size:.92em}
-.bbl.md-content p{margin:0 0 .3em;line-height:1.5}
-.bbl.md-content ul,.bbl.md-content ol{padding-left:1.2em;margin:0 0 .2em}
-.bbl.md-content li{margin:.1em 0;line-height:1.5}
-.bbl.md-content table{border-collapse:collapse;width:100%;margin:.4em 0;font-size:.85em}
-.bbl.md-content th,.bbl.md-content td{border:1px solid var(--bd2);padding:5px 8px;text-align:left}
-.bbl.md-content th{background:var(--bg3);font-weight:600;color:var(--tx)}
-.bbl.md-content td{background:var(--bg2);color:var(--tx2)}
-.bbl.md-content tr:hover td{background:var(--bg3)}
-.bbl.md-content code{background:var(--bg3);border:1px solid var(--bd);border-radius:4px;padding:1px 5px;font-family:var(--f1);font-size:.85em;color:var(--ac2)}
-.bbl.md-content pre{background:var(--bg0);border:1px solid var(--bd);border-radius:8px;padding:8px 10px;overflow-x:auto;margin:.3em 0}
-.bbl.md-content pre code{background:none;border:none;padding:0;font-size:.82em;color:var(--tx)}
-.bbl.md-content blockquote{border-left:3px solid var(--ac);padding:.2em .6em;margin:.3em 0;color:var(--tx2);background:var(--bg2);border-radius:0 4px 4px 0}
-.bbl.md-content strong{font-weight:600;color:var(--tx)}
-.bbl.md-content em{font-style:italic;color:var(--tx2)}
-.bbl.md-content hr{border:none;border-top:1px solid var(--bd);margin:.4em 0}
-.bbl.md-content a{color:var(--ac2);text-decoration:underline}
-.bbl.md-content br{display:block;margin:0;line-height:1.2}
+/* CSS Reset & Variables */
 :root{
   --bg0:#09090b;--bg1:#111115;--bg2:#18181c;--bg3:#222228;
   --bd:#2e2e36;--bd2:#3a3a44;
@@ -341,6 +255,37 @@ HTML = r"""<!DOCTYPE html>
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg0);color:var(--tx);font-family:var(--f0);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+
+/* Markdown Customization */
+.bbl.md-content h1,.bbl.md-content h2,.bbl.md-content h3{font-weight:600;margin:0 0 .2em;line-height:1.3}
+.bbl.md-content h1{font-size:1.05em}.bbl.md-content h2{font-size:.98em}.bbl.md-content h3{font-size:.92em}
+.bbl.md-content p{margin:0 0 .3em;line-height:1.5}
+.bbl.md-content ul,.bbl.md-content ol{padding-left:1.2em;margin:0 0 .2em}
+.bbl.md-content li{margin:.1em 0;line-height:1.5}
+.bbl.md-content table{border-collapse:collapse;width:100%;margin:.4em 0;font-size:.85em}
+.bbl.md-content th,.bbl.md-content td{border:1px solid var(--bd2);padding:5px 8px;text-align:left}
+.bbl.md-content th{background:var(--bg3);font-weight:600;color:var(--tx)}
+.bbl.md-content td{background:var(--bg2);color:var(--tx2)}
+.bbl.md-content tr:hover td{background:var(--bg3)}
+.bbl.md-content blockquote{border-left:3px solid var(--ac);padding:.2em .6em;margin:.3em 0;color:var(--tx2);background:var(--bg2);border-radius:0 4px 4px 0}
+.bbl.md-content strong{font-weight:600;color:var(--tx)}
+.bbl.md-content em{font-style:italic;color:var(--tx2)}
+.bbl.md-content hr{border:none;border-top:1px solid var(--bd);margin:.4em 0}
+.bbl.md-content a{color:var(--ac2);text-decoration:underline}
+
+/* Code Syntax & Copy Button */
+.code-wrap { margin: .5em 0; border: 1px solid var(--bd); border-radius: 8px; overflow: hidden; background: #282c34; }
+.code-head { display: flex; justify-content: space-between; align-items: center; padding: 4px 10px; background: #1e2227; font-family: var(--f1); font-size: .75rem; color: #abb2bf; border-bottom: 1px solid #181a1f; }
+.copy-btn { background: none; border: none; color: #abb2bf; cursor: pointer; font-size: .75rem; transition: color .15s; font-family: var(--f1); }
+.copy-btn:hover { color: #fff; }
+.bbl.md-content pre { margin: 0; padding: 10px; overflow-x: auto; font-family: var(--f1); font-size: .82rem; }
+.bbl.md-content pre code { background: none; border: none; padding: 0; color: #abb2bf; display: block; }
+.bbl.md-content :not(pre) > code { background:var(--bg3); border:1px solid var(--bd); border-radius:4px; padding:1px 5px; font-family:var(--f1); font-size:.85em; color:var(--ac2); }
+
+.stream-cursor{display:inline-block;color:var(--ac2);font-weight:400;animation:blink-cur .7s step-end infinite;margin-left:1px}
+@keyframes blink-cur{0%,100%{opacity:1}50%{opacity:0}}
+
+/* Layout */
 .topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;padding:0 16px;flex-shrink:0;gap:12px;z-index:50}
 .logo{font-family:var(--f1);font-size:.95rem;color:var(--ac2);font-weight:500;white-space:nowrap}
 .logo em{color:var(--tx2);font-style:normal}
@@ -354,30 +299,32 @@ select.sel:focus{border-color:var(--ac)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
 .icon-btn{background:var(--bg2);border:1px solid var(--bd);color:var(--tx2);width:32px;height:32px;border-radius:7px;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:.9rem;transition:all .15s}
 .icon-btn:hover{border-color:var(--ac);color:var(--ac2)}
+
 .layout{display:flex;flex:1;overflow:hidden}
-.apnav{width:56px;background:var(--bg1);border-right:1px solid var(--bd);display:flex;flex-direction:column;align-items:center;padding:10px 0;gap:4px;flex-shrink:0}
+.apnav{width:56px;background:var(--bg1);border-right:1px solid var(--bd);display:flex;flex-direction:column;align-items:center;padding:10px 0;gap:4px;flex-shrink:0; overflow:visible; z-index: 100;}
 .anv{width:40px;height:40px;border-radius:9px;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:1.05rem;color:var(--tx3);transition:all .15s;position:relative}
 .anv:hover{background:var(--bg3);color:var(--tx)}
 .anv.active{background:var(--ac3);color:#fff;box-shadow:0 2px 10px rgba(139,116,255,.3)}
-.anv .tip{position:absolute;left:52px;top:50%;transform:translateY(-50%);background:var(--bg3);border:1px solid var(--bd2);color:var(--tx);padding:4px 10px;border-radius:6px;font-size:.78rem;white-space:nowrap;pointer-events:none;opacity:0;transition:opacity .1s;z-index:99}
+.anv .tip{position:absolute;left:52px;top:50%;transform:translateY(-50%);background:var(--bg3);border:1px solid var(--bd2);color:var(--tx);padding:4px 10px;border-radius:6px;font-size:.78rem;white-space:nowrap;pointer-events:none;opacity:0;transition:opacity .1s;z-index:99; box-shadow: 0 4px 12px rgba(0,0,0,0.2);}
 .anv:hover .tip{opacity:1}
 .anv-sep{width:32px;height:1px;background:var(--bd);margin:4px 0}
+
 .hpanel{width:232px;background:var(--bg1);border-right:1px solid var(--bd);display:flex;flex-direction:column;overflow:hidden;flex-shrink:0;transition:width .2s ease}
 .hpanel.hidden{width:0;border:none}
 .hp-head{padding:10px 12px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
 .hp-title{font-size:.72rem;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:var(--tx3)}
 .hp-body{flex:1;overflow-y:auto;padding:4px}
 .hg-label{font-size:.69rem;color:var(--tx3);padding:8px 8px 3px;font-weight:500;letter-spacing:.3px}
-.hi{padding:7px 10px;border-radius:7px;cursor:pointer;font-size:.81rem;color:var(--tx2);transition:all .15s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border:1px solid transparent;margin-bottom:1px}
+.hi{padding:7px 10px;border-radius:7px;cursor:pointer;font-size:.81rem;color:var(--tx2);transition:all .15s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border:1px solid transparent;margin-bottom:1px;display:flex;align-items:center;justify-content:space-between}
 .hi:hover{background:var(--bg2);color:var(--tx)}
 .hi.active{background:var(--bg3);color:var(--tx);border-color:var(--bd2)}
 .hi-time{font-size:.67rem;color:var(--tx3);margin-top:1px}
-.hi{display:flex;align-items:center;justify-content:space-between}
 .hi-content{flex:1;overflow:hidden}
 .hi-del{opacity:0;width:20px;height:20px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:.7rem;color:var(--tx3);cursor:pointer;transition:all .15s;flex-shrink:0;margin-left:4px}
 .hi:hover .hi-del{opacity:1}
 .hi-del:hover{background:var(--rd);color:#fff}
 .h-empty{padding:24px 12px;text-align:center;color:var(--tx3);font-size:.8rem;line-height:1.6}
+
 .main{flex:1;overflow:hidden;display:flex;flex-direction:column}
 .panel{display:none;flex:1;overflow:hidden;flex-direction:column;animation:fi .18s ease}
 .panel.active{display:flex}
@@ -403,6 +350,7 @@ select.sel:focus{border-color:var(--ac)}
 .tyd span{width:6px;height:6px;border-radius:50%;background:var(--tx3);animation:td 1s infinite}
 .tyd span:nth-child(2){animation-delay:.15s}.tyd span:nth-child(3){animation-delay:.3s}
 @keyframes td{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
+
 .chat-footer{padding:10px 16px;border-top:1px solid var(--bd);background:var(--bg1);flex-shrink:0}
 .cin-wrap{display:flex;gap:8px;align-items:flex-end}
 .cin-wrap textarea{flex:1;background:var(--bg2);border:1px solid var(--bd);color:var(--tx);border-radius:10px;padding:9px 12px;font-family:var(--f0);font-size:.87rem;resize:none;outline:none;min-height:40px;max-height:130px;line-height:1.5;transition:border-color .15s}
@@ -410,6 +358,7 @@ select.sel:focus{border-color:var(--ac)}
 .sbtn{width:40px;height:40px;background:var(--ac);border:none;border-radius:10px;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:.95rem;transition:all .15s;flex-shrink:0}
 .sbtn:hover{background:var(--ac2)}.sbtn:disabled{opacity:.5;cursor:not-allowed}
 .chint{font-size:.71rem;color:var(--tx3);margin-top:5px;text-align:center}
+
 .twrap{flex:1;overflow-y:auto;padding:22px}
 .tinner{max-width:800px;margin:0 auto}
 .th2{font-size:1.1rem;font-weight:600;margin-bottom:3px;display:flex;align-items:center;gap:8px}
@@ -423,7 +372,7 @@ textarea.inp:focus,input.inp:focus,select.inp:focus{border-color:var(--ac)}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:7px 13px;border-radius:8px;border:none;font-family:var(--f0);font-size:.83rem;font-weight:500;cursor:pointer;transition:all .15s}
 .bp{background:var(--ac);color:#fff}.bp:hover{background:var(--ac2)}.bp:disabled{opacity:.5;cursor:not-allowed}
 .bg{background:var(--bg2);color:var(--tx);border:1px solid var(--bd)}.bg:hover{border-color:var(--ac);color:var(--ac2)}
-.out{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:12px;font-family:var(--f1);font-size:.82rem;line-height:1.7;color:var(--tx);white-space:pre-wrap;word-break:break-word;min-height:80px;max-height:440px;overflow-y:auto}
+.out{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:12px;font-family:var(--f1);font-size:.82rem;line-height:1.7;color:var(--tx);white-space:pre-wrap;word-break:break-word;min-height:80px;max-height:440px;overflow-y:auto; position: relative;}
 .out.ph{color:var(--tx3);font-style:italic}
 .lgrow{display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:end;margin-bottom:10px}
 .swp{height:34px;width:34px;display:flex;align-items:center;justify-content:center;background:var(--bg2);border:1px solid var(--bd);border-radius:7px;cursor:pointer;color:var(--tx2);transition:all .15s}
@@ -456,6 +405,7 @@ textarea.inp:focus,input.inp:focus,select.inp:focus{border-color:var(--ac)}
     <div class="anv" id="anav-optimizer" onclick="switchApp('optimizer')">✨<span class="tip">Tối ưu Prompt</span></div>
     <div class="anv-sep"></div>
     <div class="anv" id="anav-translate" onclick="switchApp('translate')">🌐<span class="tip">Dịch thuật</span></div>
+    <div class="anv" id="anav-imgprompt" onclick="switchApp('imgprompt')">🎨<span class="tip">Tạo Prompt Ảnh</span></div>
     <div class="anv" id="anav-review" onclick="switchApp('review')">🔍<span class="tip">Code Review</span></div>
     <div class="anv" id="anav-summary" onclick="switchApp('summary')">📄<span class="tip">Tóm tắt</span></div>
     <div class="anv" id="anav-mockdata" onclick="switchApp('mockdata')">🗄️<span class="tip">Mock Data</span></div>
@@ -465,18 +415,22 @@ textarea.inp:focus,input.inp:focus,select.inp:focus{border-color:var(--ac)}
   <div class="hpanel" id="hpanel">
     <div class="hp-head">
       <span class="hp-title">Lịch sử chat</span>
-      <div class="icon-btn" onclick="newSession()" title="Tạo mới">✏️</div>
+      <div>
+         <button class="icon-btn" style="display:inline-flex; width:28px; height:28px; font-size:.8rem" onclick="exportChat()" title="Xuất .MD">📥</button>
+         <button class="icon-btn" style="display:inline-flex; width:28px; height:28px; font-size:.8rem" onclick="newSession()" title="Tạo mới">✏️</button>
+      </div>
     </div>
     <div class="hp-body" id="hlist"></div>
   </div>
 
   <div class="main">
-
     <div class="panel active" id="panel-chat">
       <div class="chat-wrap">
         <div class="chat-toolbar">
           <span>System:</span>
+          <select id="chat-templates" class="sel" style="max-width:140px" onchange="applyTemplate()"></select>
           <input id="chat-system" placeholder="Bạn là trợ lý AI hữu ích, trả lời bằng tiếng Việt.">
+          <button class="icon-btn" style="width:28px;height:28px" onclick="saveTemplate()" title="Lưu Template">💾</button>
         </div>
         <div class="chat-msgs" id="chat-msgs">
           <div class="mrow sys"><div class="bbl">Chọn cuộc trò chuyện bên trái hoặc nhấn ✏️ để bắt đầu mới</div></div>
@@ -484,8 +438,8 @@ textarea.inp:focus,input.inp:focus,select.inp:focus{border-color:var(--ac)}
         <div class="chat-footer">
           <div id="file-preview" style="display:none;padding:6px 0 4px;display:flex;align-items:center;gap:8px"></div>
           <div class="cin-wrap">
-            <label class="fbtn" title="Đính kèm file" style="width:36px;height:36px;background:var(--bg2);border:1px solid var(--bd);border-radius:9px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--tx2);font-size:.95rem;flex-shrink:0;transition:all .15s" onmouseover="this.style.borderColor='var(--ac)'" onmouseout="this.style.borderColor='var(--bd)'">
-              📎<input type="file" id="file-input" style="display:none" onchange="onFileSelect(this)" accept=".txt,.md,.py,.js,.ts,.json,.csv,.html,.css,.xml,.yaml,.yml,.sh,.sql,.log,.pdf,.png,.jpg,.jpeg,.gif,.webp">
+            <label class="fbtn" title="Đính kèm file" style="width:36px;height:36px;background:var(--bg2);border:1px solid var(--bd);border-radius:9px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--tx2);font-size:.95rem;flex-shrink:0;transition:all .15s">
+              📎<input type="file" id="file-input" style="display:none" onchange="onFileSelect(this)">
             </label>
             <textarea id="chat-input" rows="1" placeholder="Nhập tin nhắn... (Enter gửi, Shift+Enter xuống dòng)"
               oninput="arz(this)"
@@ -499,125 +453,72 @@ textarea.inp:focus,input.inp:focus,select.inp:focus{border-color:var(--ac)}
 
     <div class="panel" id="panel-optimizer">
       <div class="twrap"><div class="tinner">
-        <div class="th2">✨ Tối ưu Prompt</div>
-        <div class="tsub">Biến ý tưởng thô thành prompt chuyên nghiệp</div>
-        <div class="card">
-          <label class="lbl">Ý tưởng ban đầu</label>
-          <textarea class="inp" id="opt-in" rows="4" placeholder="VD: Viết bài post facebook bán áo thun mùa hè"></textarea>
-          <div class="row"><button class="btn bp" id="opt-btn" onclick="tc('optimize_prompt',{text:g('opt-in')},'opt-btn','opt-out')">✨ Tối ưu hóa</button></div>
-        </div>
-        <div class="card">
-          <label class="lbl">Prompt đã tối ưu</label>
-          <div class="out ph" id="opt-out">Prompt chuyên nghiệp sẽ hiện ở đây...</div>
-          <div class="row"><button class="btn bg" onclick="cp('opt-out')">📋 Sao chép</button></div>
-        </div>
+        <div class="th2">✨ Tối ưu Prompt</div><div class="tsub">Biến ý tưởng thô thành prompt chuyên nghiệp</div>
+        <div class="card"><label class="lbl">Ý tưởng ban đầu</label><textarea class="inp" id="opt-in" rows="4"></textarea><div class="row"><button class="btn bp" id="opt-btn" onclick="tc('optimize_prompt',{text:g('opt-in')},'opt-btn','opt-out')">✨ Tối ưu hóa</button></div></div>
+        <div class="card"><label class="lbl">Prompt đã tối ưu</label><div class="out ph" id="opt-out">Prompt...</div><div class="row"><button class="btn bg" onclick="cp('opt-out')">📋 Copy</button></div></div>
       </div></div>
     </div>
 
     <div class="panel" id="panel-translate">
       <div class="twrap"><div class="tinner">
-        <div class="th2">🌐 Dịch thuật</div>
-        <div class="tsub">Dịch văn bản đa ngôn ngữ chuyên sâu</div>
+        <div class="th2">🌐 Dịch thuật</div><div class="tsub">Dịch văn bản đa ngôn ngữ chuyên sâu</div>
         <div class="card">
           <div class="lgrow">
-            <div><label class="lbl">Từ</label>
-              <select class="inp" id="tr-src" style="resize:none">
-                <option value="English">English</option><option value="Vietnamese">Tiếng Việt</option>
-                <option value="Chinese">Tiếng Trung</option><option value="Japanese">Tiếng Nhật</option>
-                <option value="Korean">Tiếng Hàn</option><option value="French">Tiếng Pháp</option>
-                <option value="German">Tiếng Đức</option>
-              </select>
-            </div>
+            <div><label class="lbl">Từ</label><select class="inp" id="tr-src"><option value="English">English</option><option value="Vietnamese">Tiếng Việt</option><option value="Chinese">Tiếng Trung</option><option value="Japanese">Tiếng Nhật</option></select></div>
             <div style="padding-top:18px"><div class="swp" onclick="swapL()">⇄</div></div>
-            <div><label class="lbl">Sang</label>
-              <select class="inp" id="tr-dst" style="resize:none">
-                <option value="Vietnamese">Tiếng Việt</option><option value="English">English</option>
-                <option value="Chinese">Tiếng Trung</option><option value="Japanese">Tiếng Nhật</option>
-                <option value="Korean">Tiếng Hàn</option><option value="French">Tiếng Pháp</option>
-                <option value="German">Tiếng Đức</option>
-              </select>
-            </div>
+            <div><label class="lbl">Sang</label><select class="inp" id="tr-dst"><option value="Vietnamese">Tiếng Việt</option><option value="English">English</option><option value="Chinese">Tiếng Trung</option><option value="Japanese">Tiếng Nhật</option></select></div>
           </div>
-          <label class="lbl">Văn bản</label>
-          <textarea class="inp" id="tr-in" rows="5" placeholder="Nhập văn bản cần dịch..."></textarea>
+          <div style="margin-bottom:10px;"><label class="lbl">Văn phong</label><select class="inp" id="tr-tone"><option value="standard">Tiêu chuẩn</option><option value="game">Dịch Game (Giữ tags)</option><option value="literary">Văn học</option></select></div>
+          <label class="lbl">Văn bản</label><textarea class="inp" id="tr-in" rows="5"></textarea>
           <div class="row">
-            <button class="btn bp" id="tr-btn" onclick="tc('translate',{text:g('tr-in'),src:g('tr-src'),dst:g('tr-dst')},'tr-btn','tr-out')">🌐 Dịch</button>
-            <button class="btn bg" onclick="cp('tr-out')">📋 Sao chép</button>
+            <button class="btn bp" id="tr-btn" onclick="tc('translate',{text:g('tr-in'),src:g('tr-src'),dst:g('tr-dst'),tone:g('tr-tone')},'tr-btn','tr-out')">🌐 Dịch</button>
+            <button class="btn bg" onclick="cp('tr-out')">📋 Sao chép</button><button class="btn bg" onclick="speakText('tr-out')">🔊 Đọc</button>
           </div>
         </div>
         <div class="card"><label class="lbl">Kết quả</label><div class="out ph" id="tr-out">Bản dịch sẽ hiện ở đây...</div></div>
       </div></div>
     </div>
 
+    <div class="panel" id="panel-imgprompt">
+      <div class="twrap"><div class="tinner">
+        <div class="th2">🎨 Tạo Prompt Ảnh</div><div class="tsub">Sinh prompt tiếng Anh cho ComfyUI, SDXL...</div>
+        <div class="card"><label class="lbl">Ý tưởng của bạn</label><textarea class="inp" id="img-in" rows="4"></textarea><div class="row"><button class="btn bp" id="img-btn" onclick="tc('imgprompt',{text:g('img-in')},'img-btn','img-out')">🎨 Viết Prompt</button><button class="btn bg" onclick="cp('img-out')">📋 Copy</button></div></div>
+        <div class="card"><label class="lbl">Prompt Ảnh (Pos/Neg)</label><div class="out ph" id="img-out">Prompt...</div></div>
+      </div></div>
+    </div>
+
     <div class="panel" id="panel-review">
       <div class="twrap"><div class="tinner">
-        <div class="th2">🔍 Code Review</div>
-        <div class="tsub">Phát hiện lỗi, tối ưu hiệu năng và bảo mật</div>
-        <div class="card">
-          <label class="lbl">Code cần review</label>
-          <textarea class="inp" id="rv-in" rows="10" placeholder="Paste code vào đây..." style="font-family:var(--f1);font-size:.81rem"></textarea>
-          <div class="row">
-            <button class="btn bp" id="rv-btn" onclick="tc('review',{code:g('rv-in')},'rv-btn','rv-out')">🔍 Review</button>
-            <button class="btn bg" onclick="cp('rv-out')">📋 Sao chép</button>
-          </div>
-        </div>
-        <div class="card"><label class="lbl">Nhận xét</label><div class="out ph" id="rv-out">Kết quả review...</div></div>
+        <div class="th2">🔍 Code Review</div><div class="tsub">Phát hiện lỗi, tối ưu hiệu năng</div>
+        <div class="card"><textarea class="inp" id="rv-in" rows="10"></textarea><div class="row"><button class="btn bp" id="rv-btn" onclick="tc('review',{code:g('rv-in')},'rv-btn','rv-out')">🔍 Review</button><button class="btn bg" onclick="cp('rv-out')">📋 Copy</button></div></div>
+        <div class="card"><label class="lbl">Nhận xét</label><div class="out ph" id="rv-out">Kết quả...</div></div>
       </div></div>
     </div>
 
     <div class="panel" id="panel-summary">
       <div class="twrap"><div class="tinner">
-        <div class="th2">📄 Tóm tắt văn bản</div>
-        <div class="tsub">Tóm tắt nhanh báo cáo, tài liệu dài</div>
-        <div class="card">
-          <label class="lbl">Văn bản</label>
-          <textarea class="inp" id="sm-in" rows="9" placeholder="Paste văn bản cần tóm tắt..."></textarea>
-          <div class="row">
-            <button class="btn bp" id="sm-btn" onclick="tc('summary',{text:g('sm-in')},'sm-btn','sm-out')">📄 Tóm tắt</button>
-            <button class="btn bg" onclick="cp('sm-out')">📋 Sao chép</button>
-          </div>
-        </div>
-        <div class="card"><label class="lbl">Kết quả</label><div class="out ph" id="sm-out">Bản tóm tắt sẽ hiện ở đây...</div></div>
+        <div class="th2">📄 Tóm tắt văn bản</div><div class="tsub">Tóm tắt báo cáo, tài liệu dài</div>
+        <div class="card"><textarea class="inp" id="sm-in" rows="9"></textarea><div class="row"><button class="btn bp" id="sm-btn" onclick="tc('summary',{text:g('sm-in')},'sm-btn','sm-out')">📄 Tóm tắt</button><button class="btn bg" onclick="cp('sm-out')">📋 Copy</button></div></div>
+        <div class="card"><label class="lbl">Kết quả</label><div class="out ph" id="sm-out">Bản tóm tắt...</div></div>
       </div></div>
     </div>
 
     <div class="panel" id="panel-mockdata">
       <div class="twrap"><div class="tinner">
-        <div class="th2">🗄️ Sinh Mock Data JSON</div>
-        <div class="tsub">Tạo dữ liệu mẫu cho testing</div>
+        <div class="th2">🗄️ Sinh Mock Data JSON</div><div class="tsub">Tạo dữ liệu mẫu cho testing</div>
         <div class="card">
-          <label class="lbl">Mẫu nhanh</label>
-          <div class="chips">
-            <span class="chip" onclick="si('mk-in','5 users: email, role, avatar, created_at')">👤 Users</span>
-            <span class="chip" onclick="si('mk-in','5 game items: name, type, damage, rarity, price')">⚔️ Game Items</span>
-            <span class="chip" onclick="si('mk-in','5 products: name, price, category, stock, rating')">📦 Products</span>
-            <span class="chip" onclick="si('mk-in','5 blog posts: title, author, content, tags, date')">📝 Blog</span>
-            <span class="chip" onclick="si('mk-in','5 API endpoints: method, path, description, params')">🔌 API Docs</span>
-          </div>
-          <label class="lbl">Mô tả schema</label>
-          <input class="inp" id="mk-in" placeholder="VD: 5 nhân vật game RPG với tên, class, level, kỹ năng">
-          <div class="row">
-            <button class="btn bp" id="mk-btn" onclick="tc('mockdata',{schema:g('mk-in')},'mk-btn','mk-out')">🗄️ Tạo dữ liệu</button>
-            <button class="btn bg" onclick="cp('mk-out')">📋 Sao chép JSON</button>
-          </div>
+          <label class="lbl">Mô tả schema</label><input class="inp" id="mk-in" placeholder="VD: 5 users...">
+          <div class="row"><button class="btn bp" id="mk-btn" onclick="tc('mockdata',{schema:g('mk-in')},'mk-btn','mk-out')">🗄️ Tạo</button><button class="btn bg" onclick="cp('mk-out')">📋 Copy</button></div>
         </div>
-        <div class="card"><label class="lbl">JSON Output</label><div class="out ph" id="mk-out" style="font-family:var(--f1);font-size:.79rem">Dữ liệu JSON sẽ hiện ở đây...</div></div>
+        <div class="card"><label class="lbl">Output</label><div class="out ph" id="mk-out">JSON...</div></div>
       </div></div>
     </div>
 
     <div class="panel" id="panel-terminal">
       <div class="twrap"><div class="tinner">
-        <div class="th2">⌨️ Trợ lý Terminal</div>
-        <div class="tsub">Giải thích lỗi, đề xuất lệnh</div>
-        <div class="card">
-          <label class="lbl">Error log hoặc yêu cầu</label>
-          <textarea class="inp" id="tm-in" rows="7" placeholder="Paste error log hoặc mô tả việc cần làm..." style="font-family:var(--f1);font-size:.81rem"></textarea>
-          <div class="row">
-            <button class="btn bp" id="tm-btn" onclick="tc('terminal',{input:g('tm-in')},'tm-btn','tm-out')">⌨️ Phân tích</button>
-            <button class="btn bg" onclick="cp('tm-out')">📋 Sao chép</button>
-          </div>
-        </div>
-        <div class="card"><label class="lbl">Kết quả</label><div class="out ph" id="tm-out">Kết quả phân tích...</div></div>
+        <div class="th2">⌨️ Trợ lý Terminal</div><div class="tsub">Giải thích lỗi, đề xuất lệnh</div>
+        <div class="card"><textarea class="inp" id="tm-in" rows="7"></textarea><div class="row"><button class="btn bp" id="tm-btn" onclick="tc('terminal',{input:g('tm-in')},'tm-btn','tm-out')">⌨️ Phân tích</button><button class="btn bg" onclick="cp('tm-out')">📋 Copy</button></div></div>
+        <div class="card"><label class="lbl">Kết quả</label><div class="out ph" id="tm-out">Kết quả...</div></div>
       </div></div>
     </div>
 
@@ -632,6 +533,80 @@ const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;
 const arz = el => { el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,130)+'px'; };
 
 let curSid=null, chatMsgs=[], hpVisible=true;
+
+// [NEW] Cấu hình Renderer Markdown + Highlight.js (Code block & Nút Copy)
+const renderer = new marked.Renderer();
+renderer.code = function(code, language) {
+  const validLang = hljs.getLanguage(language) ? language : 'plaintext';
+  const highlighted = hljs.highlight(code, { language: validLang }).value;
+  return `<div class="code-wrap">
+            <div class="code-head">
+              <span>${validLang}</span>
+              <button class="copy-btn" onclick="copyCodeBlock(this)">📋 Copy Code</button>
+            </div>
+            <pre><code class="hljs ${validLang}">${highlighted}</code></pre>
+          </div>`;
+};
+marked.setOptions({ renderer: renderer, breaks:true, gfm:true });
+
+function copyCodeBlock(btn) {
+  const code = btn.parentElement.nextElementSibling.innerText;
+  navigator.clipboard.writeText(code).then(() => {
+    const orig = btn.innerText; btn.innerText = '✅ Copied!';
+    setTimeout(() => { btn.innerText = orig; }, 2000);
+  });
+}
+
+function speakText(id) {
+    const text = document.getElementById(id).innerText;
+    if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = text.match(/[àáãạảăắằẳẵặâấầẩẫậèéẹẻẽêềếểễệđìíĩỉịòóõọỏôốồổỗộơớờởỡợùúũụủưứừửữựỳỵỷỹý]/i) ? 'vi-VN' : 'en-US';
+        window.speechSynthesis.speak(utterance);
+    }
+}
+
+// [NEW] Export Lịch sử Chat ra file Markdown
+function exportChat() {
+  if(!chatMsgs.length) return alert("Chưa có tin nhắn để xuất.");
+  let md = `# Lịch sử Chat AI (${new Date().toLocaleString('vi')})\n\n`;
+  chatMsgs.forEach(m => {
+    md += `**${m.role === 'user' ? '👤 BẠN' : '🤖 AI'}**:\n${m.content}\n\n---\n\n`;
+  });
+  const blob = new Blob([md], {type: 'text/markdown;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `chat_export_${curSid||'new'}.md`;
+  a.click(); URL.revokeObjectURL(url);
+}
+
+// [NEW] Template Management
+async function loadTemplatesDB(){
+  try{
+    const d = await(await fetch('/api/templates')).json();
+    const sel = $('chat-templates');
+    sel.innerHTML = '<option value="">-- Mẫu Prompt --</option>';
+    d.forEach(t => {
+      const opt = document.createElement('option');
+      opt.value = t.prompt; opt.textContent = t.name;
+      sel.appendChild(opt);
+    });
+  }catch(e){}
+}
+function applyTemplate(){
+  const val = $('chat-templates').value;
+  if(val) $('chat-system').value = val;
+}
+async function saveTemplate(){
+  const prompt = $('chat-system').value.trim();
+  if(!prompt) return alert('Hãy nhập prompt system trước khi lưu!');
+  const name = prompt('Nhập tên cho Template mới:');
+  if(!name) return;
+  await fetch('/api/templates', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, prompt})});
+  await loadTemplatesDB();
+  $('chat-templates').selectedIndex = $('chat-templates').options.length - 1;
+}
 
 function toggleTheme(){
   const h=document.documentElement, dark=h.getAttribute('data-theme')==='dark';
@@ -655,7 +630,6 @@ async function cp(id){
   catch(e){ const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');document.body.removeChild(a); }
 }
 
-// Providers & Models
 async function initProviders(){
   try{
     const d=await(await fetch('/api/providers')).json();
@@ -681,7 +655,6 @@ async function fetchModels(){
   }catch(e){ $('stxt').innerText='Lỗi kết nối'; }
 }
 
-// History
 async function loadHistory(){
   try{
     const ss=await(await fetch('/api/sessions')).json();
@@ -690,7 +663,7 @@ async function loadHistory(){
 }
 function renderHistory(ss){
   const el=$('hlist');
-  if(!ss.length){ el.innerHTML='<div class="h-empty">Chưa có cuộc trò chuyện<br>Nhấn ✏️ để bắt đầu</div>'; return; }
+  if(!ss.length){ el.innerHTML='<div class="h-empty">Chưa có cuộc trò chuyện</div>'; return; }
   const today=new Date().toISOString().slice(0,10);
   const yest=new Date(Date.now()-86400000).toISOString().slice(0,10);
   const groups={};
@@ -716,7 +689,6 @@ function renderHistory(ss){
 async function newSession(){
   curSid=null; chatMsgs=[];
   $('chat-msgs').innerHTML='<div class="mrow sys"><div class="bbl">Cuộc trò chuyện mới ✨</div></div>';
-  $('chat-system').value='';
   await loadHistory();
 }
 
@@ -733,147 +705,137 @@ async function loadSess(id){
 }
 
 async function delSess(id){
-  if(!confirm('Xóa cuộc trò chuyện này? Không thể hoàn tác.')) return;
+  if(!confirm('Xóa cuộc trò chuyện này?')) return;
   try{
     await fetch(`/api/sessions/${id}`,{method:'DELETE'});
-    if(curSid===id){ curSid=null; chatMsgs=[]; $('chat-msgs').innerHTML='<div class="mrow sys"><div class="bbl">Cuộc trò chuyện đã xóa. Nhấn ✏️ để bắt đầu mới.</div></div>'; }
+    if(curSid===id){ curSid=null; chatMsgs=[]; $('chat-msgs').innerHTML='<div class="mrow sys"><div class="bbl">Đã xóa. Nhấn ✏️ để tạo mới.</div></div>'; }
     await loadHistory();
   }catch(e){ console.error(e); }
 }
 
 function addBbl(role,content,time=''){
   const m=$('chat-msgs');
-  if(role==='sys'||role==='system'){
-    m.innerHTML+=`<div class="mrow sys"><div class="bbl">${esc(content)}</div></div>`;
-    return;
-  }
+  if(role==='sys'||role==='system'){ m.innerHTML+=`<div class="mrow sys"><div class="bbl">${esc(content)}</div></div>`; return; }
   const u=role==='user';
   const av=u?`<div class="av user">👤</div>`:`<div class="av ai">🤖</div>`;
-  // User: escape HTML thuần | AI: render markdown (loc bo dong trong thua)
-  let cleanContent = content;
-  if(!u){
-    // Loai bo 3+ dong trong lien tiep, giu lai 1 dong
-    cleanContent = content.replace(/\n{3,}/g, '\n\n');
-    // Loai bo space thua o dau cuoi dong
-    cleanContent = cleanContent.split('\n').map(l=>l.trimEnd()).join('\n');
-  }
-  const rendered = u
-    ? esc(cleanContent)
-    : (typeof marked !== 'undefined'
-        ? marked.parse(cleanContent, {breaks:true, gfm:true})
-        : esc(cleanContent));
+  let cleanContent = u ? content : content.replace(/\n{3,}/g, '\n\n').split('\n').map(l=>l.trimEnd()).join('\n');
+  const rendered = u ? esc(cleanContent) : marked.parse(cleanContent);
   const mdClass = u ? '' : ' md-content';
-  m.innerHTML+=`<div class="mrow ${u?'user':'ai'}">${u?'':av}
-    <div><div class="bbl${mdClass}">${rendered}</div>${time?`<div class="msg-t">${time}</div>`:''}</div>
-    ${u?av:''}</div>`;
+  m.innerHTML+=`<div class="mrow ${u?'user':'ai'}">${u?'':av}<div><div class="bbl${mdClass}">${rendered}</div>${time?`<div class="msg-t">${time}</div>`:''}</div>${u?av:''}</div>`;
   m.scrollTop=m.scrollHeight;
 }
 
-let _fileInfo = null;   // File dang duoc dinh kem
-
+let _fileInfo = null;
 function onFileSelect(input) {
-  const file = input.files[0];
-  if (!file) return;
-  const prev = $('file-preview');
-
-  // Hien thi preview
-  prev.style.display = 'flex';
-  prev.innerHTML = `
-    <span style="font-size:.8rem;background:var(--bg3);border:1px solid var(--bd);border-radius:6px;
-      padding:3px 8px;color:var(--tx2);display:flex;align-items:center;gap:6px">
-      📄 ${file.name} (${(file.size/1024).toFixed(1)}KB)
-      <span onclick="clearFile()" style="cursor:pointer;color:var(--rd);font-weight:600" title="Xoa file">✕</span>
-    </span>
-    <span id="upload-status" style="font-size:.75rem;color:var(--tx3)">Dang tai...</span>`;
-
-  // Upload len server
-  const fd = new FormData();
-  fd.append('file', file);
-  fetch('/api/upload', {method:'POST', body:fd})
-    .then(r => r.json())
-    .then(d => {
-      if (d.error) {
-        $('upload-status').textContent = '❌ ' + d.error;
-        $('upload-status').style.color = 'var(--rd)';
-        _fileInfo = null;
-      } else {
-        $('upload-status').textContent = '✅ San sang';
-        $('upload-status').style.color = 'var(--gr)';
-        _fileInfo = d;
-      }
-    })
-    .catch(e => {
-      $('upload-status').textContent = '❌ Loi upload';
-      _fileInfo = null;
-    });
-  input.value = '';
+  const file = input.files[0]; if (!file) return;
+  const prev = $('file-preview'); prev.style.display = 'flex';
+  prev.innerHTML = `<span style="font-size:.8rem;background:var(--bg3);border:1px solid var(--bd);border-radius:6px;padding:3px 8px;color:var(--tx2);display:flex;align-items:center;gap:6px">📄 ${file.name}<span onclick="clearFile()" style="cursor:pointer;color:var(--rd);">✕</span></span><span id="upload-status" style="font-size:.75rem;color:var(--tx3)">Đang tải...</span>`;
+  const fd = new FormData(); fd.append('file', file);
+  fetch('/api/upload', {method:'POST', body:fd}).then(r => r.json()).then(d => {
+    if (d.error) { $('upload-status').textContent = '❌ '+d.error; $('upload-status').style.color='var(--rd)'; _fileInfo=null; }
+    else { $('upload-status').textContent = '✅'; $('upload-status').style.color='var(--gr)'; _fileInfo=d; }
+  }).catch(e => { $('upload-status').textContent='❌ Lỗi'; _fileInfo=null; });
+  input.value='';
 }
-
-function clearFile() {
-  _fileInfo = null;
-  const prev = $('file-preview');
-  prev.style.display = 'none';
-  prev.innerHTML = '';
-}
+function clearFile() { _fileInfo=null; $('file-preview').style.display='none'; $('file-preview').innerHTML=''; }
 
 async function sendChat(){
   const inp=$('chat-input'), msg=inp.value.trim();
   if(!msg && !_fileInfo) return;
-  if(!curSid){
-    const title = msg || (_fileInfo ? 'File: ' + _fileInfo.name : 'Cuoc tro chuyen moi');
+  let isNew = !curSid;
+  if(isNew){
+    const title = msg || (_fileInfo ? 'File: ' + _fileInfo.name : 'Cuộc trò chuyện mới');
     const r=await fetch('/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({title:title.length>40?title.slice(0,40)+'...':title,
-        system_prompt:$('chat-system').value.trim(),provider:$('gp').value,model:$('gm').value})});
+      body:JSON.stringify({title:title.slice(0,40),system_prompt:$('chat-system').value.trim(),provider:$('gp').value,model:$('gm').value})});
     curSid=(await r.json()).id;
   }
   const now=new Date().toLocaleTimeString('vi',{hour:'2-digit',minute:'2-digit'});
-  // Hien thi tin nhan user (co the co label file)
-  const userLabel = msg + (_fileInfo ? `
-📎 ${_fileInfo.name}` : '');
+  const userLabel = msg + (_fileInfo ? `\n📎 ${_fileInfo.name}` : '');
   addBbl('user', userLabel, now);
   chatMsgs.push({role:'user', content: msg || `[File: ${_fileInfo?.name}]`});
   inp.value=''; inp.style.height='auto';
-  const fileToSend = _fileInfo;
-  clearFile();
-  $('sbtn').disabled=true;
-  const m=$('chat-msgs');
-  m.innerHTML+=`<div class="mrow ai" id="trow"><div class="av ai">🤖</div><div class="bbl"><div class="tyd"><span></span><span></span><span></span></div></div></div>`;
+  const fileToSend = _fileInfo; clearFile(); $('sbtn').disabled=true;
+
+  const m=$('chat-msgs'); const rowId='trow_'+Date.now();
+  m.innerHTML+=`<div class="mrow ai" id="${rowId}"><div class="av ai">🤖</div><div><div class="bbl md-content" id="bbl_${rowId}"><div class="tyd"><span></span><span></span><span></span></div></div><div class="msg-t" id="ts_${rowId}"></div></div></div>`;
   m.scrollTop=m.scrollHeight;
+
+  let fullText=''; let renderTimer=null; const bbl=()=>$('bbl_'+rowId);
+  function renderMd(){
+    if(renderTimer) return;
+    renderTimer=setTimeout(()=>{
+      renderTimer=null; const el=bbl(); if(!el) return;
+      let clean=fullText.replace(/\n{3,}/g,'\n\n').split('\n').map(l=>l.trimEnd()).join('\n');
+      el.innerHTML=marked.parse(clean)+'<span class="stream-cursor">▋</span>';
+      m.scrollTop=m.scrollHeight;
+    },50);
+  }
+
   try{
-    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:msg, history:chatMsgs, file:fileToSend,
-        system:$('chat-system').value.trim()||'Ban la tro ly AI huu ich.',
-        provider:$('gp').value, model:$('gm').value, session_id:curSid})});
-    const d=await r.json();
-    $('trow')?.remove();
-    const reply=d.reply||'(Khong co phan hoi)';
-    const t2=new Date().toLocaleTimeString('vi',{hour:'2-digit',minute:'2-digit'});
-    addBbl('ai',reply,t2);
-    chatMsgs.push({role:'assistant',content:reply});
-    await loadHistory();
-  }catch(e){ $('trow')?.remove(); addBbl('sys','❌ Loi: '+e.message); }
+    const resp=await fetch('/api/chat/stream',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:msg, history:chatMsgs, file:fileToSend, system:$('chat-system').value.trim(), provider:$('gp').value, model:$('gm').value, session_id:curSid})
+    });
+    if(!resp.ok || !resp.body) throw new Error('Stream not supported');
+    const reader=resp.body.getReader(); const decoder=new TextDecoder(); let buf='';
+    while(true){
+      const {done,value}=await reader.read(); if(done) break;
+      buf+=decoder.decode(value,{stream:true}); const lines=buf.split('\n'); buf=lines.pop();
+      for(const line of lines){
+        if(!line.startsWith('data:')) continue;
+        try{
+          const ev=JSON.parse(line.slice(5).trim());
+          if(ev.chunk!==undefined){ fullText+=ev.chunk; renderMd(); }
+          else if(ev.done){
+            if(renderTimer){ clearTimeout(renderTimer); renderTimer=null; }
+            const el=bbl();
+            if(el){ el.innerHTML=marked.parse(fullText.replace(/\n{3,}/g,'\n\n')); }
+            const tsEl=$('ts_'+rowId); if(tsEl) tsEl.textContent=new Date().toLocaleTimeString('vi',{hour:'2-digit',minute:'2-digit'});
+            chatMsgs.push({role:'assistant',content:fullText});
+            
+            // [NEW] Kích hoạt Auto-title nếu là session mới
+            if (isNew && fullText) {
+                fetch(`/api/sessions/${curSid}/autotitle`, {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({message: msg || fullText, provider:$('gp').value, model:$('gm').value})
+                }).then(() => loadHistory());
+            } else {
+                await loadHistory();
+            }
+          } else if(ev.error){ bbl().textContent='❌ Lỗi: '+ev.error; }
+        }catch(_){}
+      }
+    }
+  }catch(e){
+    $('bbl_'+rowId).innerHTML='<div class="tyd"><span></span><span></span><span></span></div>';
+    try{
+      const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({message:msg, history:chatMsgs, file:fileToSend, system:$('chat-system').value.trim(), provider:$('gp').value, model:$('gm').value, session_id:curSid})});
+      const d=await r.json(); fullText=d.reply||'(Không có phản hồi)';
+      const el=bbl(); if(el){ el.innerHTML=marked.parse(fullText); }
+      chatMsgs.push({role:'assistant',content:fullText});
+      if(isNew) fetch(`/api/sessions/${curSid}/autotitle`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:msg, provider:$('gp').value, model:$('gm').value})}).then(()=>loadHistory());
+      else await loadHistory();
+    }catch(e2){ bbl().textContent='❌ Lỗi: '+e2.message; }
+  }
   $('sbtn').disabled=false;
 }
 
 async function tc(ep,payload,btnId,outId){
   if(Object.values(payload).some(v=>!v)) return;
   const btn=$(btnId), out=$(outId);
-  btn.dataset.orig=btn.innerHTML;
-  btn.innerHTML='<span class="sp"></span> Đang xử lý...';
-  btn.disabled=true;
+  btn.dataset.orig=btn.innerHTML; btn.innerHTML='<span class="sp"></span>...'; btn.disabled=true;
   out.textContent='⏳ Đang xử lý...'; out.classList.remove('ph');
   payload.provider=$('gp').value; payload.model=$('gm').value;
   try{
     const r=await fetch('/api/'+ep,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    const d=await r.json();
-    out.textContent=d.result||d.error||'(Không có kết quả)';
+    const d=await r.json(); out.textContent=d.result||d.error||'(LLM trả về rỗng. Hãy kiểm tra Model.)';
   }catch(e){ out.textContent='❌ Lỗi: '+e.message; }
   btn.innerHTML=btn.dataset.orig; btn.disabled=false;
 }
 
 window.onload=async()=>{
-  await initProviders();
-  await loadHistory();
+  await initProviders(); await loadHistory(); await loadTemplatesDB();
   const ss=await(await fetch('/api/sessions')).json();
   if(ss.length) await loadSess(ss[0].id);
 };
@@ -886,158 +848,147 @@ window.onload=async()=>{
 def index(): return HTML
 
 @app.route('/api/providers')
-def api_providers():
-    return jsonify({k:{"name":v["name"],"default":v["default_model"]} for k,v in PROVIDERS.items()})
+def api_providers(): return jsonify({k:{"name":v["name"],"default":v["default_model"]} for k,v in PROVIDERS.items()})
 
 @app.route('/api/models')
 def api_models():
-    p = request.args.get('provider','lmstudio')
-    cfg = PROVIDERS.get(p, PROVIDERS["lmstudio"])
+    p = request.args.get('provider','lmstudio'); cfg = PROVIDERS.get(p, PROVIDERS["lmstudio"])
     try:
         ids = [m.id for m in get_client(p).models.list().data]
         d = cfg["default_model"]
         if d in ids: ids.insert(0, ids.pop(ids.index(d)))
         return jsonify({"models":ids,"default":d})
-    except:
-        return jsonify({"models":[],"default":cfg["default_model"]})
+    except: return jsonify({"models":[],"default":cfg["default_model"]})
+
+# [NEW] Routes for Templates
+@app.route('/api/templates', methods=['GET'])
+def get_templates(): return jsonify(db_fetchall("SELECT * FROM templates ORDER BY name"))
+
+@app.route('/api/templates', methods=['POST'])
+def save_template():
+    d = request.json; tid = str(uuid.uuid4())
+    db_execute("INSERT INTO templates VALUES (?,?,?)", (tid, d['name'], d['prompt']))
+    return jsonify({"status":"ok"})
 
 @app.route('/api/sessions', methods=['GET'])
-def get_sessions():
-    rows = db_fetchall("SELECT * FROM sessions ORDER BY updated_at DESC LIMIT 100")
-    return jsonify(rows)
+def get_sessions(): return jsonify(db_fetchall("SELECT * FROM sessions ORDER BY updated_at DESC LIMIT 100"))
 
 @app.route('/api/sessions', methods=['POST'])
 def create_session():
     d=request.json; sid=str(uuid.uuid4()); ts=now_str()
-    db_execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?)",
-        (sid, d.get('title','Cuoc tro chuyen moi'), d.get('system_prompt',''),
-         d.get('provider','lmstudio'), d.get('model',''), ts, ts))
+    db_execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?)", (sid, d.get('title','Cuoc tro chuyen moi'), d.get('system_prompt',''), d.get('provider','lmstudio'), d.get('model',''), ts, ts))
     return jsonify({"id":sid,"title":d.get('title'),"created_at":ts,"updated_at":ts})
 
 @app.route('/api/sessions/<sid>', methods=['GET'])
 def get_session(sid):
-    s  = db_fetchone("SELECT * FROM sessions WHERE id=?", (sid,))
-    ms = db_fetchall("SELECT * FROM messages WHERE session_id=? ORDER BY id", (sid,))
+    s = db_fetchone("SELECT * FROM sessions WHERE id=?", (sid,))
     if not s: return jsonify({"error":"Not found"}), 404
-    return jsonify({"session": s, "messages": ms})
+    return jsonify({"session": s, "messages": db_fetchall("SELECT * FROM messages WHERE session_id=? ORDER BY id", (sid,))})
 
 @app.route('/api/sessions/<sid>', methods=['DELETE'])
 def delete_session(sid):
-    db_execute("DELETE FROM messages WHERE session_id=?", (sid,))
-    db_execute("DELETE FROM sessions WHERE id=?", (sid,))
+    db_execute("DELETE FROM messages WHERE session_id=?", (sid,)); db_execute("DELETE FROM sessions WHERE id=?", (sid,))
     return jsonify({"ok": True})
+
+# [NEW] Auto-title Route
+@app.route('/api/sessions/<sid>/autotitle', methods=['POST'])
+def auto_title(sid):
+    d = request.json
+    try:
+        title = llm_call([{"role": "system", "content": "You are a title generator. Generate a very short (max 5 words) Vietnamese title summarizing the user's message. Output ONLY the title, no quotes, no extra text."},
+                          {"role": "user", "content": d.get('message', '')}], d, max_tokens=20, temperature=0.5)
+        if title: db_execute("UPDATE sessions SET title=? WHERE id=?", (title[:50], sid))
+        return jsonify({"title": title})
+    except: return jsonify({"error": "Failed"})
 
 @app.route('/api/upload', methods=['POST'])
 def api_upload():
-    """Nhan file, tra ve noi dung da xu ly de chat."""
-    if 'file' not in request.files:
-        return jsonify({"error": "Khong co file"}), 400
-    f = request.files['file']
-    content_data, ctype, fname = _read_file_content(f)
-    if ctype == "too_large":
-        return jsonify({"error": f"File qua lon (toi da {MAX_FILE_MB}MB)"}), 400
-    if content_data is None:
-        return jsonify({"error": f"Dinh dang khong ho tro: {fname}"}), 400
-    return jsonify({"content": content_data, "type": ctype,
-                    "name": fname, "is_image": ctype not in ("text","too_large")})
+    if 'file' not in request.files: return jsonify({"error": "Khong co file"}), 400
+    content_data, ctype, fname = _read_file_content(request.files['file'])
+    if ctype == "too_large": return jsonify({"error": f"File qua lon (toi da {MAX_FILE_MB}MB)"}), 400
+    if content_data is None: return jsonify({"error": f"Dinh dang khong ho tro"}), 400
+    return jsonify({"content": content_data, "type": ctype, "name": fname, "is_image": ctype not in ("text","too_large")})
 
 @app.route('/api/chat', methods=['POST'])
 def api_chat():
-    d         = request.json
-    sid       = d.get('session_id')
-    user_msg  = d.get('message', '')
-    file_info = d.get('file')         # {"content":..., "type":..., "name":..., "is_image":...}
-    provider  = d.get('provider', 'lmstudio')
-    system    = d.get("system", "Ban la tro ly AI huu ich.")
-
-    msgs = [{"role": "system", "content": system}]
+    d = request.json; sid = d.get('session_id'); file_info = d.get('file')
+    msgs = [{"role": "system", "content": d.get("system", "Ban la tro ly AI huu ich.")}]
     msgs.extend(d.get("history", []))
-
-    # Xu ly file dinh kem
     if file_info:
-        fname = file_info.get("name", "file")
-        if file_info.get("is_image"):
-            # Anh: dung vision API (ho tro LM Studio vision model, OpenRouter)
-            mime = file_info["type"]
-            b64  = file_info["content"]
-            user_content = [
-                {"type": "text",      "text": user_msg or f"Phan tich anh: {fname}"},
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
-            ]
-            msgs.append({"role": "user", "content": user_content})
-        else:
-            # Van ban/code: nhung noi dung vao message
-            ftext  = file_info["content"]
-            block  = f"[File: {fname}]\n```\n{ftext}\n```"
-            prompt = block + "\n\n" + user_msg if user_msg else block + "\n\nHay phan tich noi dung file nay."
-            msgs.append({"role": "user", "content": prompt})
-    else:
-        msgs.append({"role": "user", "content": user_msg})
-
+        if file_info.get("is_image"): msgs.append({"role": "user", "content": [{"type": "text", "text": d.get('message', '')}, {"type": "image_url", "image_url": {"url": f"data:{file_info['type']};base64,{file_info['content']}"}}]})
+        else: msgs.append({"role": "user", "content": f"[File: {file_info['name']}]\n```\n{file_info['content']}\n```\n\n" + d.get('message', '')})
+    else: msgs.append({"role": "user", "content": d.get('message', '')})
     reply = llm_call(msgs, d, max_tokens=4096, temperature=0.7)
-
     if sid:
-        ts = now_str()
-        label = user_msg + (f" [+{file_info['name']}]" if file_info else "")
-        db_execute("INSERT INTO messages (session_id,role,content,created_at) VALUES (?,?,?,?)",
-                   (sid, 'user', label, ts))
-        db_execute("INSERT INTO messages (session_id,role,content,created_at) VALUES (?,?,?,?)",
-                   (sid, 'assistant', reply, ts))
+        ts = now_str(); label = d.get('message','') + (f" [+{file_info['name']}]" if file_info else "")
+        db_execute("INSERT INTO messages (session_id,role,content,created_at) VALUES (?,?,?,?)", (sid, 'user', label, ts))
+        db_execute("INSERT INTO messages (session_id,role,content,created_at) VALUES (?,?,?,?)", (sid, 'assistant', reply, ts))
         db_execute("UPDATE sessions SET updated_at=? WHERE id=?", (ts, sid))
     return jsonify({"reply": reply})
 
+@app.route('/api/chat/stream', methods=['POST'])
+def api_chat_stream():
+    d = request.json; sid = d.get('session_id'); file_info = d.get('file'); user_msg = d.get('message','')
+    msgs = [{"role": "system", "content": d.get("system", "Ban la tro ly AI huu ich.")}]
+    msgs.extend(d.get("history", []))
+    if file_info:
+        if file_info.get("is_image"): msgs.append({"role": "user", "content": [{"type": "text", "text": user_msg}, {"type": "image_url", "image_url": {"url": f"data:{file_info['type']};base64,{file_info['content']}"}}]})
+        else: msgs.append({"role": "user", "content": f"[File: {file_info['name']}]\n```\n{file_info['content']}\n```\n\n" + user_msg})
+    else: msgs.append({"role": "user", "content": user_msg})
+    def generate():
+        full = []
+        try:
+            for chunk in llm_call_stream(msgs, d, max_tokens=4096, temperature=0.7): full.append(chunk); yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+        except Exception as e: yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        finally:
+            rt = "".join(full)
+            if sid and rt:
+                ts = now_str(); label = user_msg + (f" [+{file_info['name']}]" if file_info else "")
+                db_execute("INSERT INTO messages (session_id,role,content,created_at) VALUES (?,?,?,?)", (sid, 'user', label, ts))
+                db_execute("INSERT INTO messages (session_id,role,content,created_at) VALUES (?,?,?,?)", (sid, 'assistant', rt, ts))
+                db_execute("UPDATE sessions SET updated_at=? WHERE id=?", (ts, sid))
+            yield f"data: {json.dumps({'done': True})}\n\n"
+    return Response(generate(), mimetype='text/event-stream', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
 @app.route('/api/optimize_prompt', methods=['POST'])
 def api_optimize():
-    d=request.json
-    r=llm_call([{"role":"system","content":"Bạn là chuyên gia Prompt Engineering. Viết lại thành prompt chuyên nghiệp, chi tiết. Chỉ trả về prompt, không giải thích."},
-                {"role":"user","content":f"Yêu cầu: {d['text']}"}],d,max_tokens=1024,temperature=0.5)
+    d=request.json; r=llm_call([{"role":"system","content":"Bạn là chuyên gia Prompt Engineering. Viết lại thành prompt chuyên nghiệp, chi tiết. Chỉ trả về prompt, không giải thích."},{"role":"user","content":f"Yêu cầu: {d['text']}"}],d,max_tokens=1024,temperature=0.5)
     return jsonify({"result":r})
 
 @app.route('/api/translate', methods=['POST'])
 def api_translate():
-    d=request.json
-    r=llm_call([{"role":"system","content":f"Translate to {d['dst']}. Output ONLY the translation."},
-                {"role":"user","content":f"Translate from {d['src']}:\n{d['text']}"}],d,max_tokens=1024,temperature=0.3)
+    d = request.json; sp = f"Translate to {d['dst']}. Output ONLY the translation without any explanations."
+    if d.get('tone') == 'game': sp += " This is game localization. STRICTLY preserve all code tags, brackets, and variables (e.g., [name], {color}, etc.). Do not translate code logic."
+    elif d.get('tone') == 'literary': sp += " Use a literary, poetic, and highly natural tone appropriate for novels or storytelling."
+    r=llm_call([{"role":"system","content":sp},{"role":"user","content":f"Translate from {d['src']}:\n{d['text']}"}],d,max_tokens=2048,temperature=0.3)
+    return jsonify({"result":r})
+
+@app.route('/api/imgprompt', methods=['POST'])
+def api_imgprompt():
+    d=request.json; r=llm_call([{"role":"system","content":"Bạn là chuyên gia viết prompt tạo ảnh. Hãy tạo Positive Prompt và Negative Prompt bằng Tiếng Anh. Không giải thích."},{"role":"user","content":f"Ý tưởng: {d['text']}"}],d,max_tokens=1024,temperature=0.7)
     return jsonify({"result":r})
 
 @app.route('/api/review', methods=['POST'])
 def api_review():
-    d=request.json
-    r=llm_call([{"role":"system","content":"You are a senior developer. Review code, find bugs and suggest improvements in Vietnamese."},
-                {"role":"user","content":f"Review:\n```\n{d['code']}\n```"}],d,max_tokens=2048,temperature=0.2)
+    d=request.json; r=llm_call([{"role":"system","content":"You are a senior developer. Review code, find bugs and suggest improvements in Vietnamese."},{"role":"user","content":f"Review:\n```\n{d['code']}\n```"}],d,max_tokens=2048,temperature=0.2)
     return jsonify({"result":r})
 
 @app.route('/api/summary', methods=['POST'])
 def api_summary():
-    d=request.json
-    r=llm_call([{"role":"system","content":"Tóm tắt súc tích, đầy đủ bằng tiếng Việt."},
-                {"role":"user","content":f"Tóm tắt:\n{d['text'][:8000]}"}],d,max_tokens=1024,temperature=0.3)
+    d=request.json; r=llm_call([{"role":"system","content":"Tóm tắt súc tích, đầy đủ bằng tiếng Việt."},{"role":"user","content":f"Tóm tắt:\n{d['text'][:8000]}"}],d,max_tokens=1024,temperature=0.3)
     return jsonify({"result":r})
 
 @app.route('/api/mockdata', methods=['POST'])
 def api_mockdata():
-    d=request.json
-    r=llm_call([{"role":"system","content":"Output ONLY a valid JSON array. No markdown, no backticks."},
-                {"role":"user","content":f"Generate JSON: {d['schema']}"}],d,max_tokens=2048,temperature=0.8)
+    d=request.json; r=llm_call([{"role":"system","content":"Output ONLY a valid JSON array. No markdown, no backticks."},{"role":"user","content":f"Generate JSON: {d['schema']}"}],d,max_tokens=2048,temperature=0.8)
     return jsonify({"result":r})
 
 @app.route('/api/terminal', methods=['POST'])
 def api_terminal():
-    d=request.json
-    r=llm_call([{"role":"system","content":"Chuyên gia DevOps. Giải thích lỗi hoặc đưa lệnh terminal chính xác bằng tiếng Việt."},
-                {"role":"user","content":d['input']}],d,max_tokens=1024,temperature=0.2)
+    d=request.json; r=llm_call([{"role":"system","content":"Chuyên gia DevOps. Giải thích lỗi hoặc đưa lệnh terminal chính xác bằng tiếng Việt."},{"role":"user","content":d['input']}],d,max_tokens=1024,temperature=0.2)
     return jsonify({"result":r})
 
 if __name__=='__main__':
-    # init_db() đã chạy ở module level — không cần gọi lại
-    import socket
-    ip=socket.gethostbyname(socket.gethostname())
-    print(f"\n{'='*46}\n  AI Apps v2.0 — SQLite Chat History\n{'='*46}")
-    print(f"  Local : http://localhost:5000")
-    print(f"  LAN   : http://{ip}:5000")
-    print(f"  DB    : {_db_path if not USE_TURSO else TURSO_URL}")
-    print(f"\n  Deploy Render: Thêm biến môi trường:")
-    print(f"    GROQ_API_KEY, OPENROUTER_API_KEY, APP_PASSWORD")
-    print(f"    DB_PATH=/var/data/chat.db  (nếu dùng Render Disk)")
-    print(f"{'='*46}\n")
+    import socket; ip=socket.gethostbyname(socket.gethostname())
+    print(f"\n{'='*46}\n  AI Apps v2.4 — Templates, Highlight & Export\n{'='*46}\n  Local : http://localhost:5000\n  LAN   : http://{ip}:5000\n  DB    : {_db_path if not USE_TURSO else TURSO_URL}\n{'='*46}\n")
     app.run(host='0.0.0.0',port=5000,debug=False)
