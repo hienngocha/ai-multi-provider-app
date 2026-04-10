@@ -35,8 +35,8 @@ from google import genai
 try:
     from config import LM_STUDIO_URL, REQUEST_TIMEOUT, GROQ_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY
 except ImportError:
-#    LM_STUDIO_URL      = "http://127.0.0.1:1234"
-#    REQUEST_TIMEOUT    = 120
+    LM_STUDIO_URL      = "http://127.0.0.1:1234"
+    REQUEST_TIMEOUT    = 120
     GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -46,7 +46,7 @@ except ImportError:
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 app = Flask(__name__)
 PROVIDERS = {
-#    "lmstudio":   {"name": "LM Studio (Local)",       "base_url": f"{LM_STUDIO_URL}/v1",             "api_key": "lm-studio",        "default_model": "local-model"},
+    "lmstudio":   {"name": "LM Studio (Local)",       "base_url": f"{LM_STUDIO_URL}/v1",             "api_key": "lm-studio",        "default_model": "local-model"},
 #    "ollama":     {"name": "Ollama (Local)",          "base_url": f"{OLLAMA_URL}/v1",                "api_key": "ollama",           "default_model": ""},
 #    "ollama_cloud":     {"name": "Ollama (Cloud)",          "base_url": "https://ollama.com/api/v1",                "api_key": "OLLAMA_API_KEY",    "default_model": "minimax-m2.7:cloud"},
     "groq":       {"name": "Groq (Cloud - Fast)",      "base_url": "https://api.groq.com/openai/v1",  "api_key": GROQ_API_KEY,       "default_model": "llama3-70b-8192"},
