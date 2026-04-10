@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-lmstudio_webapp.py - v3.0 (Supercharged)
+lmstudio_webapp.py - v3.1 (Patched)
 ==========================
-Web app AI voi giao dien moi + luu lich su chat + nhieu tinh nang nang cap.
-
-Database:
-  - Local / LAN : SQLite (mac dinh, khong can cai them)
-  - Render cloud: Turso (libSQL cloud, mien phi 5GB)
-
-Cai dat:
-  pip install flask openai requests
-
-Chay local:
-  python lmstudio_webapp.py
+Fix loi Unauthorized API & Turso DB Schema Mismatch
 """
 
 from flask import Flask, request, jsonify, Response
@@ -22,7 +12,6 @@ import json, os, re, sqlite3, uuid
 from datetime import datetime
 from pathlib import Path
 import urllib.parse
-from ollama import chat
 
 # ===== CONFIG =====
 try:
@@ -42,13 +31,14 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 app = Flask(__name__)
 
 PROVIDERS = {
-    "lmstudio":    {"name": "LM Studio (Local)",       "base_url": f"{LM_STUDIO_URL}/v1",                          "api_key": "lm-studio",        "default_model": "local-model"},
-    "ollama_cloud": {"name": "Ollama (Cloud)",          "base_url": "https://api.ollama.com/v1",                     "api_key": OLLAMA_API_KEY,      "default_model": "minimax-m2.7:cloud"},
-    "groq":        {"name": "Groq (Cloud - Fast)",      "base_url": "https://api.groq.com/openai/v1",               "api_key": GROQ_API_KEY,        "default_model": "llama3-70b-8192"},
-    "openrouter":  {"name": "OpenRouter (Multi-Model)", "base_url": "https://openrouter.ai/api/v1",                  "api_key": OPENROUTER_API_KEY,  "default_model": "google/gemini-pro-1.5"},
-    "gemini":      {"name": "Gemini",                   "base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "api_key": GEMINI_API_KEY,  "default_model": "Gemma 4 31B"},
-    "deepSeek":    {"name": "DeepSeek",                 "base_url": "https://api.deepseek.com/v1",                   "api_key": DEEPSEEK_API_KEY,    "default_model": "deepseek-chat"},
-    "grok":        {"name": "Grok",                     "base_url": "https://api.x.ai/v1",                           "api_key": XAI_API_KEY,         "default_model": "grok-4.20-reasoning-latest"},
+    "lmstudio":   {"name": "LM Studio (Local)",       "base_url": f"{LM_STUDIO_URL}/v1",             "api_key": "lm-studio",        "default_model": "local-model"},
+    "ollama_cloud": {"name": "Ollama (Cloud)",        "base_url": "https://api.ollama.com/v1",       "api_key": OLLAMA_API_KEY,     "default_model": "minimax-m2.7:cloud"},
+    "ollama":     {"name": "Ollama (Local)",          "base_url": f"{OLLAMA_URL}/v1",                "api_key": "ollama",           "default_model": ""},
+    "groq":       {"name": "Groq (Cloud - Fast)",      "base_url": "https://api.groq.com/openai/v1", "api_key": GROQ_API_KEY,       "default_model": "llama3-70b-8192"},
+    "openrouter": {"name": "OpenRouter (Multi-Model)", "base_url": "https://openrouter.ai/api/v1",   "api_key": OPENROUTER_API_KEY, "default_model": "google/gemini-pro-1.5"},
+    "gemini":     {"name": "Gemini", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",    "api_key": GEMINI_API_KEY, "default_model": "Gemma 4 31B"},
+    "deepSeek":   {"name": "DeepSeek", "base_url": "https://api.deepseek.com/v1",    "api_key": DEEPSEEK_API_KEY, "default_model": "deepseek-chat"},
+    "grok":       {"name": "Grok", "base_url": "https://api.x.ai/v1",    "api_key": XAI_API_KEY, "default_model": "grok-4.20-reasoning-latest"},
 }
 
 # ===== DATABASE =====
@@ -118,6 +108,13 @@ def init_db():
         _turso_http(_CREATE_SESSIONS)
         _turso_http(_CREATE_MESSAGES)
         _turso_http(_CREATE_TEMPLATES)
+        
+        # MIGRATE: Thêm cột cho bảng Templates cũ nếu chưa có (Fix lỗi 3 cột)
+        try: _turso_http("ALTER TABLE templates ADD COLUMN category TEXT DEFAULT 'General'")
+        except: pass
+        try: _turso_http("ALTER TABLE templates ADD COLUMN created_at TEXT DEFAULT ''")
+        except: pass
+            
         print(f"  DB : Turso HTTP API ({TURSO_URL})")
     else:
         _db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -192,6 +189,10 @@ def llm_call(messages, d, max_tokens=1024, temperature=0.7):
         return parse_reply(resp.choices[0].message.content or "")
     except Exception as e:
         err = str(e)
+        # FIX Lỗi Unauthorized: Bắt lỗi xác thực API Key rõ ràng hơn
+        if '401' in err or 'unauthorized' in err.lower() or 'authentication' in err.lower() or 'invalid api key' in err.lower():
+            return "❌ Lỗi Xác Thực API: Sai hoặc thiếu API Key cho nhà cung cấp này. Vui lòng kiểm tra lại biến môi trường (VD: GROQ_API_KEY, OPENROUTER_API_KEY)."
+        
         if '429' in err and 'groq' in d.get('provider',''):
             _time.sleep(15)
             try:
@@ -229,7 +230,12 @@ def llm_call_stream(messages, d, max_tokens=4096, temperature=0.7):
             for tok in _STOP_TOKS: buf = buf.replace(tok, "")
             if buf: yield buf
     except Exception as e:
-        yield f"\n\n❌ Lỗi streaming: {str(e)}"
+        err = str(e)
+        # FIX Lỗi Unauthorized: Bắt lỗi xác thực API Key rõ ràng hơn
+        if '401' in err or 'unauthorized' in err.lower() or 'authentication' in err.lower() or 'invalid api key' in err.lower():
+            yield "\n\n❌ Lỗi Xác Thực API: Sai hoặc thiếu API Key cho nhà cung cấp này. Vui lòng kiểm tra lại biến môi trường!"
+        else:
+            yield f"\n\n❌ Lỗi streaming: {err}"
 
 import base64, mimetypes
 ALLOWED_EXT = {'.txt','.md','.py','.js','.ts','.json','.csv','.html','.css','.xml','.yaml','.yml','.ini','.sh','.bat','.sql','.log','.pdf','.png','.jpg','.jpeg','.gif','.webp'}
@@ -433,8 +439,6 @@ textarea.inp{min-height:88px}textarea.inp:focus,input.inp:focus,select.inp:focus
   </div>
 
   <div class="main">
-
-    <!-- CHAT PANEL -->
     <div class="panel active" id="panel-chat">
       <div class="chat-wrap">
         <div class="chat-toolbar" style="position:relative">
@@ -461,7 +465,6 @@ textarea.inp{min-height:88px}textarea.inp:focus,input.inp:focus,select.inp:focus
       </div>
     </div>
 
-    <!-- OPTIMIZER PANEL -->
     <div class="panel" id="panel-optimizer">
       <div class="twrap"><div class="tinner">
         <div class="th2">✨ Tối ưu Prompt</div><div class="tsub">Biến ý tưởng thô thành prompt chuyên nghiệp</div>
@@ -477,7 +480,6 @@ textarea.inp{min-height:88px}textarea.inp:focus,input.inp:focus,select.inp:focus
       </div></div>
     </div>
 
-    <!-- TRANSLATE PANEL -->
     <div class="panel" id="panel-translate">
       <div class="twrap"><div class="tinner">
         <div class="th2">🌐 Dịch thuật</div><div class="tsub">Dịch văn bản đa ngôn ngữ chuyên sâu</div>
@@ -513,7 +515,6 @@ textarea.inp{min-height:88px}textarea.inp:focus,input.inp:focus,select.inp:focus
       </div></div>
     </div>
 
-    <!-- REVIEW PANEL -->
     <div class="panel" id="panel-review">
       <div class="twrap"><div class="tinner">
         <div class="th2">🔍 Code Review</div><div class="tsub">Phát hiện lỗi, tối ưu hiệu năng và bảo mật</div>
@@ -529,7 +530,6 @@ textarea.inp{min-height:88px}textarea.inp:focus,input.inp:focus,select.inp:focus
       </div></div>
     </div>
 
-    <!-- SUMMARY PANEL -->
     <div class="panel" id="panel-summary">
       <div class="twrap"><div class="tinner">
         <div class="th2">📄 Tóm tắt văn bản</div><div class="tsub">Tóm tắt nhanh báo cáo, tài liệu dài</div>
@@ -546,7 +546,6 @@ textarea.inp{min-height:88px}textarea.inp:focus,input.inp:focus,select.inp:focus
       </div></div>
     </div>
 
-    <!-- MOCKDATA PANEL -->
     <div class="panel" id="panel-mockdata">
       <div class="twrap"><div class="tinner">
         <div class="th2">🗄️ Sinh Mock Data JSON</div><div class="tsub">Tạo dữ liệu mẫu cho testing</div>
@@ -568,7 +567,6 @@ textarea.inp{min-height:88px}textarea.inp:focus,input.inp:focus,select.inp:focus
       </div></div>
     </div>
 
-    <!-- TERMINAL PANEL -->
     <div class="panel" id="panel-terminal">
       <div class="twrap"><div class="tinner">
         <div class="th2">⌨️ Trợ lý Terminal</div><div class="tsub">Giải thích lỗi, đề xuất lệnh</div>
@@ -584,7 +582,6 @@ textarea.inp{min-height:88px}textarea.inp:focus,input.inp:focus,select.inp:focus
       </div></div>
     </div>
 
-    <!-- IMAGE PROMPT PANEL (NEW) -->
     <div class="panel" id="panel-imgprompt">
       <div class="twrap"><div class="tinner">
         <div class="th2">🎨 Tạo Prompt Ảnh</div><div class="tsub">Biến ý tưởng thành Prompt chuẩn SDXL / FLUX (Pos & Neg)</div>
@@ -606,7 +603,6 @@ textarea.inp{min-height:88px}textarea.inp:focus,input.inp:focus,select.inp:focus
 </div>
 
 <script>
-// Setup Marked + Highlight.js
 marked.setOptions({
   breaks: true, gfm: true,
   highlight: function(code, lang) {
@@ -615,7 +611,6 @@ marked.setOptions({
   }
 });
 
-// Custom renderer to add COPY button and language label to code blocks
 const renderer = new marked.Renderer();
 renderer.code = function(code, lang) {
   const language = lang || 'text';
@@ -641,13 +636,12 @@ const arz = el => { el.style.height='auto'; el.style.height=Math.min(el.scrollHe
 
 let curSid=null, chatMsgs=[], hpVisible=true;
 
-// TTS Function (Web Speech API)
 function speakText(id) {
   const text = $(id).innerText;
   if(!text || text.includes('sẽ hiện ở đây')) return;
   window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = 'vi-VN'; // Co the thay doi tuy ngon ngu
+  utterance.lang = 'vi-VN'; 
   window.speechSynthesis.speak(utterance);
 }
 
@@ -669,7 +663,6 @@ async function cp(id){
   try{ await navigator.clipboard.writeText(t); } catch(e){ const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');document.body.removeChild(a); }
 }
 
-// Providers & Models
 async function initProviders(){
   try{
     const d=await(await fetch('/api/providers')).json();
@@ -695,7 +688,6 @@ async function fetchModels(){
   }catch(e){ $('stxt').innerText='Lỗi kết nối'; }
 }
 
-// Templates
 async function loadTemplates() {
   try {
     const ts = await (await fetch('/api/templates')).json();
@@ -729,7 +721,6 @@ async function saveTmpl() {
   alert('Đã lưu Template!');
 }
 
-// History & Search & Export
 async function loadHistory(query=''){
   try{
     const url = query ? `/api/sessions/search?q=${encodeURIComponent(query)}` : '/api/sessions';
@@ -845,7 +836,6 @@ async function sendChat(){
   const inp=$('chat-input'), msg=inp.value.trim();
   if(!msg && !_fileInfo) return;
   if(!curSid){
-    // AUTO-TITLE: Lấy tối đa 40 ký tự của tin nhắn đầu tiên làm tiêu đề
     const autoTitle = (msg || (_fileInfo ? 'File: ' + _fileInfo.name : 'New Chat')).slice(0, 40) + (msg.length > 40 ? '...' : '');
     const r=await fetch('/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({title:autoTitle, system_prompt:$('chat-system').value.trim(),provider:$('gp').value,model:$('gm').value})});
@@ -883,7 +873,7 @@ async function sendChat(){
 
   try{
     const resp=await fetch('/api/chat/stream',{
-      method:'POST', headers:{'Content-Type':'application/json'},
+      method:'POST', credentials: 'same-origin', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({message:msg, history:chatMsgs, file:fileToSend, system:$('chat-system').value.trim()||'Ban la tro ly AI huu ich.', provider:$('gp').value, model:$('gm').value, session_id:curSid})
     });
     if(!resp.ok || !resp.body) throw new Error('Stream not supported');
@@ -920,7 +910,7 @@ async function sendChat(){
   }catch(e){
     $('bbl_'+rowId).innerHTML='<div class="tyd"><span></span><span></span><span></span></div>';
     try{
-      const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+      const r=await fetch('/api/chat',{method:'POST', credentials: 'same-origin', headers:{'Content-Type':'application/json'},
         body:JSON.stringify({message:msg, history:chatMsgs, file:fileToSend, system:$('chat-system').value.trim()||'Ban la tro ly AI huu ich.', provider:$('gp').value, model:$('gm').value, session_id:curSid})});
       const d=await r.json(); const reply=d.reply||'(Khong co phan hoi)'; fullText=reply;
       const el=bbl(); if(el){ let clean=reply.replace(/\n{3,}/g,'\n\n').split('\n').map(l=>l.trimEnd()).join('\n'); el.innerHTML=marked.parse(clean); }
@@ -941,7 +931,6 @@ async function tc(ep,payload,btnId,outId){
   try{
     const r=await fetch('/api/'+ep,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     const d=await r.json();
-    // Render markdown cho cac tab
     if(d.result) {
       out.innerHTML = marked.parse(d.result.replace(/\n{3,}/g,'\n\n'));
     } else {
@@ -981,7 +970,6 @@ def api_models():
     except:
         return jsonify({"models":[],"default":cfg["default_model"]})
 
-# --- TEMPLATE ROUTES ---
 @app.route('/api/templates', methods=['GET'])
 def get_templates():
     rows = db_fetchall("SELECT * FROM templates ORDER BY category, name")
@@ -990,7 +978,9 @@ def get_templates():
 @app.route('/api/templates', methods=['POST'])
 def create_template():
     d=request.json; tid=str(uuid.uuid4()); ts=now_str()
-    db_execute("INSERT INTO templates VALUES (?,?,?,?)", (tid, d.get('name',''), d.get('content',''), d.get('category','General'), ts))
+    # FIX: Khai báo rõ ràng cột insert vào Database để tránh lỗi lệch cột
+    db_execute("INSERT INTO templates (id, name, content, category, created_at) VALUES (?,?,?,?,?)", 
+               (tid, d.get('name',''), d.get('content',''), d.get('category','General'), ts))
     return jsonify({"id":tid})
 
 @app.route('/api/templates/<tid>', methods=['GET'])
@@ -1004,7 +994,6 @@ def delete_template(tid):
     db_execute("DELETE FROM templates WHERE id=?", (tid,))
     return jsonify({"ok": True})
 
-# --- SESSION ROUTES ---
 @app.route('/api/sessions', methods=['GET'])
 def get_sessions():
     rows = db_fetchall("SELECT * FROM sessions ORDER BY updated_at DESC LIMIT 100")
@@ -1130,7 +1119,6 @@ def api_translate():
     style = d.get('style', 'normal')
     if style == 'game':
         sys_prompt = f"You are a professional game translator. Translate to {d['dst']}. MUST keep all code tags, variables ({{}}, [], <>, Ren'Py syntax) INTACT. Do NOT translate code, only text."
-        #sys_prompt = f"You are a professional game translator. Translate to {d['dst']}. MUST keep all code tags, variables ({}, [], <>, Ren'Py syntax) INTACT. Do NOT translate code, only text."
     elif style == 'literature':
         sys_prompt = f"You are a literary translator. Translate to {d['dst']} with poetic, flowing, and emotionally resonant language. Maintain the author's tone and style."
     else:
@@ -1181,7 +1169,7 @@ Output format EXACTLY like this, nothing else:
 if __name__=='__main__':
     import socket
     ip=socket.gethostbyname(socket.gethostname())
-    print(f"\n{'='*46}\n  AI Apps v3.0 Supercharged — SQLite\n{'='*46}")
+    print(f"\n{'='*46}\n  AI Apps v3.1 Patched — SQLite\n{'='*46}")
     print(f"  Local : http://localhost:5000")
     print(f"  LAN   : http://{ip}:5000")
     print(f"  DB    : {_db_path if not USE_TURSO else TURSO_URL}")
