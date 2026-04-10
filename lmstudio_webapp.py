@@ -841,21 +841,17 @@ async function sendChat(){
   m.scrollTop=m.scrollHeight;
   try{
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:msg, history:chatMsgs, file:fSend,
-        system:$('chat-system').value, provider:$('gp').value, model:$('gm').value, session_id:curSid})});
-    
-    // THÊM ĐOẠN NÀY ĐỂ BẮT LỖI HTML TỪ RENDER
-    if (!r.ok) {
-        throw new Error(`Server quá tải hoặc phản hồi quá lâu (Mã lỗi: ${r.status})`);
-    }
-
-    const reply=(await r.json()).reply;
-    addBbl('ai',reply); chatMsgs.push({role:'assistant',content:reply});
+      body:JSON.stringify({message:msg, history:chatMsgs, file:fileToSend,
+        system:$('chat-system').value.trim()||'Ban la tro ly AI huu ich.',
+        provider:$('gp').value, model:$('gm').value, session_id:curSid})});
+    const d=await r.json();
+    $('trow')?.remove();
+    const reply=d.reply||'(Khong co phan hoi)';
+    const t2=new Date().toLocaleTimeString('vi',{hour:'2-digit',minute:'2-digit'});
+    addBbl('ai',reply,t2);
+    chatMsgs.push({role:'assistant',content:reply});
     await loadHistory();
-  }catch(e){ 
-    $('trow')?.remove(); 
-    addBbl('sys','❌ ' + e.message); 
-  }
+  }catch(e){ $('trow')?.remove(); addBbl('sys','❌ Loi: '+e.message); }
   $('sbtn').disabled=false;
 }
 
