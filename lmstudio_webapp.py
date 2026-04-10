@@ -31,7 +31,6 @@ import json, os, re, sqlite3, uuid
 from datetime import datetime
 from pathlib import Path
 from google import genai
-from ollama import chat
 
 # ===== CONFIG =====
 try:
