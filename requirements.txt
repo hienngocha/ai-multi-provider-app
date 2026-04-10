@@ -4,3 +4,4 @@ gunicorn
 libsql-client
 pypdf
 requests
+google-genai
