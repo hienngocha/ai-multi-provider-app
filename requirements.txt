@@ -5,3 +5,4 @@ libsql-client
 pypdf
 requests
 google-genai
+ollama
