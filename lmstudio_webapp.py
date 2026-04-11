@@ -34,7 +34,7 @@ from google import genai
 from ollama import chat
 # ===== CONFIG =====
 try:
-    from config import LM_STUDIO_URL, REQUEST_TIMEOUT, GROQ_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, DEEPSEEK_API_KEY, XAI_API_KEY, OLLAMA_API_KEY
+    from config import LM_STUDIO_URL, REQUEST_TIMEOUT, GROQ_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, OLLAMA_API_KEY
 except ImportError:
     LM_STUDIO_URL      = "http://127.0.0.1:1234"
     REQUEST_TIMEOUT    = 120
@@ -42,8 +42,8 @@ except ImportError:
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
     OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
-    DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-    XAI_API_KEY = os.environ.get("XAI_API_KEY", "")
+#    DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+#    XAI_API_KEY = os.environ.get("XAI_API_KEY", "")
 
 # Thêm dòng này cho Ollama (Mặc định Ollama chạy port 11434)
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
