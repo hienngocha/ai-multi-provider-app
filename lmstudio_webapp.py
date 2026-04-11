@@ -32,8 +32,8 @@ app = Flask(__name__)
 
 PROVIDERS = {
     "lmstudio":   {"name": "LM Studio (Local)",       "base_url": f"{LM_STUDIO_URL}/v1",             "api_key": "lm-studio",        "default_model": "local-model"},
-    "ollama_cloud": {"name": "Ollama (Cloud)",        "base_url": "https://api.ollama.com/v1",       "api_key": OLLAMA_API_KEY,     "default_model": "minimax-m2.7:cloud"},
-    "ollama":     {"name": "Ollama (Local)",          "base_url": f"{OLLAMA_URL}/v1",                "api_key": "ollama",           "default_model": ""},
+    "ollama_cloud": {"name": "Ollama (Cloud)",        "base_url": "https://ollama.com/v1",       "api_key": OLLAMA_API_KEY,     "default_model": "glm-5.1"},
+#    "ollama":     {"name": "Ollama (Local)",          "base_url": f"{OLLAMA_URL}/v1",                "api_key": "ollama",           "default_model": ""},
     "groq":       {"name": "Groq (Cloud - Fast)",      "base_url": "https://api.groq.com/openai/v1", "api_key": GROQ_API_KEY,       "default_model": "llama3-70b-8192"},
     "openrouter": {"name": "OpenRouter (Multi-Model)", "base_url": "https://openrouter.ai/api/v1",   "api_key": OPENROUTER_API_KEY, "default_model": "google/gemini-pro-1.5"},
     "gemini":     {"name": "Gemini", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",    "api_key": GEMINI_API_KEY, "default_model": "Gemma 4 31B"},
