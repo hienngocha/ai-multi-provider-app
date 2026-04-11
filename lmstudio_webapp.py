@@ -1387,7 +1387,7 @@ def api_chat():
     else:
         msgs.append({"role": "user", "content": user_msg})
 
-    reply = llm_call(msgs, d, max_tokens=4096, temperature=0.7)
+    reply = llm_call(msgs, d, max_tokens=8192, temperature=0.7)
 
     if sid:
         ts = now_str()
@@ -1433,7 +1433,7 @@ def api_chat_stream():
     def generate():
         full_reply = []
         try:
-            for chunk in llm_call_stream(msgs, d, max_tokens=4096, temperature=0.7):
+            for chunk in llm_call_stream(msgs, d, max_tokens=8192, temperature=0.7):
                 full_reply.append(chunk)
                 # SSE format: data: <json>\n\n
                 yield f"data: {json.dumps({'chunk': chunk})}\n\n"
